@@ -1,0 +1,36 @@
+# Core dependencies from pyproject.toml
+# NOTE: For macOS (especially Apple Silicon), use requirements-macos.txt instead
+#       which uses tensorflow-macos and tensorflow-metal for compatibility
+accelerate>=0.25.0
+draccus==0.8.0
+einops
+huggingface_hub
+json-numpy
+jsonlines
+matplotlib
+peft==0.11.1
+protobuf
+rich
+sentencepiece==0.1.99
+timm==0.9.10
+tokenizers==0.19.1
+torch==2.2.0
+torchvision==0.17.0
+torchaudio==2.2.0
+transformers==4.40.1
+wandb
+tensorflow==2.15.0
+tensorflow_datasets>=4.9.0
+tensorflow_graphics==2021.12.3
+
+# dlimp from git
+git+https://github.com/moojink/dlimp_openvla
+
+# Additional dependencies for concept mining
+datasets
+tqdm
+numpy
+
+# Optional: Flash Attention 2 (install separately with --no-build-isolation)
+# flash-attn==2.5.5
+
