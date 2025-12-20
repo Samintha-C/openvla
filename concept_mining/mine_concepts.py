@@ -13,11 +13,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+    try:
+        tf.config.set_visible_devices(gpus, "GPU")
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"GPU available: {len(gpus)} device(s)")
+        print(f"GPU devices: {[gpu.name for gpu in gpus]}")
+    except RuntimeError as e:
+        print(f"GPU configuration error: {e}")
+        gpus = []
+else:
+    print("No GPU devices found, using CPU")
+
 from prismatic.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, StateEncoding
 from prismatic.vla.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
 from prismatic.vla.datasets.rlds.oxe.materialize import make_oxe_dataset_kwargs
 from prismatic.vla.datasets.rlds.dataset import make_dataset_from_rlds
 from concept_mining.extractors import ProprioceptiveExtractor
+
+if gpus:
+    try:
+        tf.config.set_visible_devices(gpus, "GPU")
+    except RuntimeError:
+        pass
 
 
 def get_state_encoding_str(state_encoding: StateEncoding) -> str:
@@ -30,11 +50,76 @@ def get_state_encoding_str(state_encoding: StateEncoding) -> str:
     return mapping.get(state_encoding, "NONE")
 
 
+TFDS_TO_OXE_NAME_MAP = {
+    "bridge": "bridge_oxe",
+    "bridge_dataset": "bridge_oxe",
+}
+
+
+def extract_concepts_batch_gpu(
+    proprio_batch: tf.Tensor,
+    state_encoding_str: str,
+    gripper_closed_threshold: float,
+    arm_moving_epsilon: float,
+    table_height: float,
+) -> Dict[str, tf.Tensor]:
+    """
+    Extract concepts from a batch of proprioceptive states using GPU.
+    
+    Args:
+        proprio_batch: Tensor of shape [batch_size, state_dim]
+        state_encoding_str: State encoding type
+        gripper_closed_threshold: Threshold for gripper closed
+        arm_moving_epsilon: Threshold for arm moving
+        table_height: Table height threshold
+    
+    Returns:
+        Dictionary of concept tensors, each of shape [batch_size]
+    """
+    if state_encoding_str == "POS_EULER" or state_encoding_str == "POS_QUAT":
+        eef_pos = proprio_batch[:, :3]
+        gripper_state = proprio_batch[:, -1]
+        
+        gripper_closed = tf.cast(gripper_state < gripper_closed_threshold, tf.float32)
+        
+        eef_pos_prev = tf.concat([[eef_pos[0]], eef_pos[:-1]], axis=0)
+        delta_pos = tf.norm(eef_pos - eef_pos_prev, axis=1)
+        arm_moving = tf.cast(delta_pos > arm_moving_epsilon, tf.float32)
+        arm_moving = tf.concat([[0.0], arm_moving[1:]], axis=0)
+        
+        height_above_table = tf.cast(eef_pos[:, 2] > table_height, tf.float32)
+        
+    elif state_encoding_str == "JOINT":
+        gripper_state = proprio_batch[:, -1]
+        joint_pos = proprio_batch[:, :-1]
+        
+        gripper_closed = tf.cast(gripper_state < gripper_closed_threshold, tf.float32)
+        
+        joint_pos_prev = tf.concat([[joint_pos[0]], joint_pos[:-1]], axis=0)
+        delta_pos = tf.norm(joint_pos - joint_pos_prev, axis=1)
+        arm_moving = tf.cast(delta_pos > arm_moving_epsilon, tf.float32)
+        arm_moving = tf.concat([[0.0], arm_moving[1:]], axis=0)
+        
+        height_above_table = tf.zeros_like(gripper_closed)
+    else:
+        batch_size = tf.shape(proprio_batch)[0]
+        gripper_closed = tf.zeros([batch_size], dtype=tf.float32)
+        arm_moving = tf.zeros([batch_size], dtype=tf.float32)
+        height_above_table = tf.zeros([batch_size], dtype=tf.float32)
+    
+    return {
+        "gripper_closed": gripper_closed,
+        "arm_moving": arm_moving,
+        "height_above_table": height_above_table,
+    }
+
+
 def extract_concepts_from_trajectory(
     traj: Dict[str, Any],
     dataset_name: str,
     episode_idx: int,
     extractor: ProprioceptiveExtractor,
+    use_gpu: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Extract concepts from a single trajectory.
@@ -54,31 +139,61 @@ def extract_concepts_from_trajectory(
     if state_encoding == StateEncoding.NONE:
         return concept_records
     
-    extractor.reset()
-    
     proprio = traj["observation"]["proprio"]
     
     if isinstance(proprio, tf.Tensor):
         traj_len = int(proprio.shape[0])
-        proprio_np = proprio.numpy()
+        proprio_tf = proprio
     else:
         traj_len = len(proprio)
-        proprio_np = np.array(proprio)
+        proprio_tf = tf.constant(proprio, dtype=tf.float32)
     
     episode_id = f"{dataset_name}_episode_{episode_idx:06d}"
     
-    for frame_idx in range(traj_len):
-        proprio_frame = proprio_np[frame_idx]
+    if use_gpu and gpus:
+        try:
+            with tf.device("/GPU:0"):
+                concepts_dict = extract_concepts_batch_gpu(
+                    proprio_tf,
+                    state_encoding_str,
+                    extractor.gripper_closed_threshold,
+                    extractor.arm_moving_epsilon,
+                    extractor.table_height,
+                )
+                
+                concepts_np = {k: v.numpy() for k, v in concepts_dict.items()}
+                
+                for frame_idx in range(traj_len):
+                    concept_record = {
+                        "dataset_name": dataset_name,
+                        "episode_id": episode_id,
+                        "frame_index": int(frame_idx),
+                        "concepts": {
+                            "gripper_closed": float(concepts_np["gripper_closed"][frame_idx]),
+                            "arm_moving": float(concepts_np["arm_moving"][frame_idx]),
+                            "height_above_table": float(concepts_np["height_above_table"][frame_idx]),
+                        },
+                    }
+                    concept_records.append(concept_record)
+        except Exception as e:
+            print(f"GPU extraction failed, falling back to CPU: {e}")
+            use_gpu = False
+    
+    if not use_gpu or not gpus:
+        extractor.reset()
+        proprio_np = proprio_tf.numpy() if isinstance(proprio_tf, tf.Tensor) else np.array(proprio)
         
-        concepts = extractor.extract(proprio_frame, state_encoding_str)
-        
-        concept_record = {
-            "dataset_name": dataset_name,
-            "episode_id": episode_id,
-            "frame_index": int(frame_idx),
-            "concepts": concepts,
-        }
-        concept_records.append(concept_record)
+        for frame_idx in range(traj_len):
+            proprio_frame = proprio_np[frame_idx]
+            concepts = extractor.extract(proprio_frame, state_encoding_str)
+            
+            concept_record = {
+                "dataset_name": dataset_name,
+                "episode_id": episode_id,
+                "frame_index": int(frame_idx),
+                "concepts": concepts,
+            }
+            concept_records.append(concept_record)
     
     return concept_records
 
@@ -106,9 +221,18 @@ def mine_concepts_pass_a(
     """
     print(f"Mining concepts from {dataset_name} (split={'train' if train else 'val'})...")
     
-    dataset_config = OXE_DATASET_CONFIGS.get(dataset_name)
+    oxe_dataset_name = TFDS_TO_OXE_NAME_MAP.get(dataset_name, dataset_name)
+    dataset_config = OXE_DATASET_CONFIGS.get(oxe_dataset_name)
     if dataset_config is None:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
+        available = list(OXE_DATASET_CONFIGS.keys())[:10]
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. "
+            f"Available OXE datasets include: {', '.join(available)}... "
+            f"(Total: {len(OXE_DATASET_CONFIGS)}). "
+            f"Note: TFDS dataset names may differ from OXE config names."
+        )
+    
+    print(f"Using OXE config name: {oxe_dataset_name}")
     
     state_encoding = dataset_config.get("state_encoding", StateEncoding.NONE)
     if state_encoding == StateEncoding.NONE:
@@ -122,7 +246,7 @@ def mine_concepts_pass_a(
     )
     
     dataset_kwargs = make_oxe_dataset_kwargs(
-        dataset_name=dataset_name,
+        dataset_name=oxe_dataset_name,
         data_root_dir=data_dir,
         load_camera_views=("primary",),
         load_depth=False,
@@ -130,12 +254,14 @@ def mine_concepts_pass_a(
         load_language=False,
     )
     
+    dataset_kwargs["name"] = dataset_name
+    
     try:
         ds, _ = make_dataset_from_rlds(
             train=train,
             shuffle=False,
-            num_parallel_reads=1,
-            num_parallel_calls=1,
+            num_parallel_reads=tf.data.AUTOTUNE,
+            num_parallel_calls=tf.data.AUTOTUNE,
             **dataset_kwargs,
         )
     except Exception as e:
@@ -146,7 +272,9 @@ def mine_concepts_pass_a(
     
     all_concept_records = []
     
-    print(f"Iterating through trajectories...")
+    use_gpu = len(gpus) > 0
+    print(f"Iterating through trajectories (GPU: {use_gpu})...")
+    
     for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
         if "observation" not in traj:
             continue
@@ -154,7 +282,9 @@ def mine_concepts_pass_a(
         if "proprio" not in traj["observation"]:
             continue
         
-        concept_records = extract_concepts_from_trajectory(traj, dataset_name, traj_idx, extractor)
+        concept_records = extract_concepts_from_trajectory(
+            traj, dataset_name, traj_idx, extractor, use_gpu=use_gpu
+        )
         all_concept_records.extend(concept_records)
         
         if (traj_idx + 1) % 100 == 0:
