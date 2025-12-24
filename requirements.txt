@@ -30,6 +30,7 @@ git+https://github.com/moojink/dlimp_openvla
 datasets
 tqdm
 numpy
+seaborn
 
 # Optional: Flash Attention 2 (install separately with --no-build-isolation)
 # flash-attn==2.5.5

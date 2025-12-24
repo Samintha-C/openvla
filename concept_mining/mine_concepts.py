@@ -13,19 +13,30 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-gpus = tf.config.list_physical_devices("GPU")
-if gpus:
-    try:
-        tf.config.set_visible_devices(gpus, "GPU")
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"GPU available: {len(gpus)} device(s)")
-        print(f"GPU devices: {[gpu.name for gpu in gpus]}")
-    except RuntimeError as e:
-        print(f"GPU configuration error: {e}")
+import os
+USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
+
+if USE_GPU:
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        try:
+            tf.config.set_visible_devices(gpus, "GPU")
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"GPU enabled: {len(gpus)} device(s)")
+            print(f"GPU devices: {[gpu.name for gpu in gpus]}")
+        except RuntimeError as e:
+            print(f"GPU configuration error: {e}")
+            gpus = []
+            USE_GPU = False
+    else:
+        print("No GPU devices found, using CPU")
+        USE_GPU = False
         gpus = []
 else:
-    print("No GPU devices found, using CPU")
+    tf.config.set_visible_devices([], "GPU")
+    gpus = []
+    print("GPU disabled (USE_GPU=false), using CPU only")
 
 from prismatic.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, StateEncoding
 from prismatic.vla.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
@@ -272,8 +283,13 @@ def mine_concepts_pass_a(
     
     all_concept_records = []
     
-    use_gpu = len(gpus) > 0
+    use_gpu = USE_GPU and len(gpus) > 0
     print(f"Iterating through trajectories (GPU: {use_gpu})...")
+    if not use_gpu:
+        print("Note: Running in CPU-only mode. Set USE_GPU=true environment variable to enable GPU.")
+    
+    gpu_used_count = 0
+    cpu_fallback_count = 0
     
     for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
         if "observation" not in traj:
@@ -282,13 +298,27 @@ def mine_concepts_pass_a(
         if "proprio" not in traj["observation"]:
             continue
         
-        concept_records = extract_concepts_from_trajectory(
-            traj, dataset_name, traj_idx, extractor, use_gpu=use_gpu
-        )
+        try:
+            concept_records = extract_concepts_from_trajectory(
+                traj, dataset_name, traj_idx, extractor, use_gpu=use_gpu
+            )
+            if use_gpu and len(gpus) > 0:
+                gpu_used_count += 1
+            else:
+                cpu_fallback_count += 1
+        except Exception as e:
+            print(f"Error extracting concepts from trajectory {traj_idx}: {e}")
+            cpu_fallback_count += 1
+            concept_records = extract_concepts_from_trajectory(
+                traj, dataset_name, traj_idx, extractor, use_gpu=False
+            )
+        
         all_concept_records.extend(concept_records)
         
         if (traj_idx + 1) % 100 == 0:
             print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records")
+            if use_gpu:
+                print(f"  GPU trajectories: {gpu_used_count}, CPU fallback: {cpu_fallback_count}")
     
     print(f"Total concept records: {len(all_concept_records)}")
     
