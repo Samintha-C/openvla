@@ -1,12 +1,13 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import numpy as np
 import tensorflow as tf
 import dlimp as dl
 from datasets import Dataset
 from tqdm import tqdm
+import torch
 
 import sys
 from pathlib import Path
@@ -42,7 +43,8 @@ from prismatic.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, StateEn
 from prismatic.vla.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
 from prismatic.vla.datasets.rlds.oxe.materialize import make_oxe_dataset_kwargs
 from prismatic.vla.datasets.rlds.dataset import make_dataset_from_rlds
-from concept_mining.extractors import ProprioceptiveExtractor
+from concept_mining.extractors import ProprioceptiveExtractor, GeometricExtractor
+from PIL import Image
 
 if gpus:
     try:
@@ -338,29 +340,57 @@ def mine_concepts_pass_a(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Mine Pass A (proprioceptive) concepts from RLDS datasets")
+    parser = argparse.ArgumentParser(description="Mine concepts from RLDS datasets")
+    parser.add_argument("--pass_type", type=str, choices=["a", "b", "ab"], default="a",
+                       help="Which pass to run: 'a' (proprioceptive), 'b' (geometric), 'ab' (both)")
     parser.add_argument("--dataset_name", type=str, required=True, help="RLDS dataset name")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing RLDS data")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save concept dataset")
     parser.add_argument("--train", action="store_true", default=True, help="Use train split (default: True)")
     parser.add_argument("--val", action="store_true", help="Use validation split")
-    parser.add_argument("--gripper_closed_threshold", type=float, default=0.05, help="Gripper closed threshold")
-    parser.add_argument("--arm_moving_epsilon", type=float, default=0.01, help="Arm moving epsilon threshold")
-    parser.add_argument("--table_height", type=float, default=0.0, help="Table height threshold")
+    
+    parser.add_argument("--gripper_closed_threshold", type=float, default=0.05, help="Gripper closed threshold (Pass A)")
+    parser.add_argument("--arm_moving_epsilon", type=float, default=0.01, help="Arm moving epsilon threshold (Pass A)")
+    parser.add_argument("--table_height", type=float, default=0.0, help="Table height threshold (Pass A)")
+    
+    parser.add_argument("--groundingdino_config", type=str, default=None,
+                       help="Path to GroundingDINO config file (Pass B)")
+    parser.add_argument("--groundingdino_checkpoint", type=str, default=None,
+                       help="Path to GroundingDINO checkpoint (Pass B)")
+    parser.add_argument("--text_threshold", type=float, default=0.25, help="Text threshold for GroundingDINO (Pass B)")
+    parser.add_argument("--box_threshold", type=float, default=0.3, help="Box threshold for GroundingDINO (Pass B)")
+    parser.add_argument("--alignment_pixel_threshold", type=float, default=50.0,
+                       help="Pixel distance threshold for alignment (Pass B)")
     
     args = parser.parse_args()
     
     train = not args.val
     
-    mine_concepts_pass_a(
-        dataset_name=args.dataset_name,
-        data_dir=Path(args.data_dir),
-        output_path=Path(args.output_path),
-        train=train,
-        gripper_closed_threshold=args.gripper_closed_threshold,
-        arm_moving_epsilon=args.arm_moving_epsilon,
-        table_height=args.table_height,
-    )
+    if args.pass_type in ["a", "ab"]:
+        output_path_a = Path(args.output_path) if args.pass_type == "a" else Path(args.output_path).with_suffix(".pass_a")
+        mine_concepts_pass_a(
+            dataset_name=args.dataset_name,
+            data_dir=Path(args.data_dir),
+            output_path=output_path_a,
+            train=train,
+            gripper_closed_threshold=args.gripper_closed_threshold,
+            arm_moving_epsilon=args.arm_moving_epsilon,
+            table_height=args.table_height,
+        )
+    
+    if args.pass_type in ["b", "ab"]:
+        output_path_b = Path(args.output_path) if args.pass_type == "b" else Path(args.output_path).with_suffix(".pass_b")
+        mine_concepts_pass_b(
+            dataset_name=args.dataset_name,
+            data_dir=Path(args.data_dir),
+            output_path=output_path_b,
+            train=train,
+            groundingdino_config=args.groundingdino_config,
+            groundingdino_checkpoint=args.groundingdino_checkpoint,
+            text_threshold=args.text_threshold,
+            box_threshold=args.box_threshold,
+            alignment_pixel_threshold=args.alignment_pixel_threshold,
+        )
 
 
 if __name__ == "__main__":
