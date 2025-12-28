@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import os
 USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
 
+# TensorFlow GPU setup (only affects Pass A)
+# Note: Pass B (GroundingDINO) uses PyTorch and will automatically detect GPU
 if USE_GPU:
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
@@ -24,20 +26,21 @@ if USE_GPU:
             tf.config.set_visible_devices(gpus, "GPU")
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"GPU enabled: {len(gpus)} device(s)")
-            print(f"GPU devices: {[gpu.name for gpu in gpus]}")
+            print(f"TensorFlow GPU enabled: {len(gpus)} device(s)")
+            print(f"TensorFlow GPU devices: {[gpu.name for gpu in gpus]}")
         except RuntimeError as e:
-            print(f"GPU configuration error: {e}")
+            print(f"TensorFlow GPU configuration error: {e}")
             gpus = []
             USE_GPU = False
     else:
-        print("No GPU devices found, using CPU")
+        print("No TensorFlow GPU devices found")
         USE_GPU = False
         gpus = []
 else:
     tf.config.set_visible_devices([], "GPU")
     gpus = []
-    print("GPU disabled (USE_GPU=false), using CPU only")
+    # Only print this if we're actually running Pass A
+    # (We'll check pass_type in main() and print there if needed)
 
 from prismatic.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, StateEncoding
 from prismatic.vla.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
