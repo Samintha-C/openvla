@@ -3,14 +3,14 @@ from pathlib import Path
 import numpy as np
 from datasets import load_from_disk
 import tensorflow as tf
+import tensorflow_datasets as tfds
+import dlimp as dl
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from prismatic.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, StateEncoding
-from prismatic.vla.datasets.rlds.oxe.materialize import make_oxe_dataset_kwargs
-from prismatic.vla.datasets.rlds.dataset import make_dataset_from_rlds
 import matplotlib.pyplot as plt
 from PIL import Image
 
@@ -47,18 +47,26 @@ def extract_image_from_trajectory(traj, frame_index, camera_view="primary"):
     
     obs = traj["observation"]
     
+    img = None
     if "image" in obs:
         images = obs["image"]
         if isinstance(images, dict):
             if camera_view in images:
                 img = images[camera_view]
-            else:
+            elif len(images) > 0:
                 img = list(images.values())[0]
+        elif isinstance(images, (list, tuple)) and len(images) > 0:
+            img = images[0] if isinstance(images[0], (np.ndarray, tf.Tensor)) else images
         else:
             img = images
     elif "rgb" in obs:
         img = obs["rgb"]
-    else:
+    elif "image_primary" in obs:
+        img = obs["image_primary"]
+    elif "image_workspace" in obs:
+        img = obs["image_workspace"]
+    
+    if img is None:
         return None
     
     if isinstance(img, tf.Tensor):
@@ -110,30 +118,16 @@ def view_concept_images(
     concept_names = list(concept_dataset[0]["concepts"].keys())
     print(f"Concepts: {concept_names}")
     
-    oxe_dataset_name = TFDS_TO_OXE_NAME_MAP.get(dataset_name, dataset_name)
-    dataset_config = OXE_DATASET_CONFIGS.get(oxe_dataset_name)
-    if dataset_config is None:
-        print(f"Warning: Dataset {dataset_name} not found in OXE configs. Trying anyway...")
-    
-    dataset_kwargs = make_oxe_dataset_kwargs(
-        dataset_name=oxe_dataset_name,
-        data_root_dir=rlds_data_dir,
-        load_camera_views=("primary",),
-        load_depth=False,
-        load_proprio=True,
-        load_language=True,
-    )
-    dataset_kwargs["name"] = dataset_name
-    
-    print(f"Loading RLDS dataset {dataset_name}...")
+    print(f"Loading raw RLDS dataset {dataset_name} (without transforms)...")
     try:
-        ds, _ = make_dataset_from_rlds(
-            train=True,
+        builder = tfds.builder(dataset_name, data_dir=str(rlds_data_dir))
+        ds = dl.DLataset.from_rlds(
+            builder,
+            split="train" if True else "val",
             shuffle=False,
             num_parallel_reads=1,
-            num_parallel_calls=1,
-            **dataset_kwargs,
         )
+        print(f"Loaded dataset with {builder.info.splits['train'].num_examples if 'train' in builder.info.splits else 'unknown'} examples")
     except Exception as e:
         print(f"Error loading dataset: {e}")
         import traceback
@@ -176,15 +170,24 @@ def view_concept_images(
                         pass
                 
                 if episode_idx is not None:
+                    print(f"  Loading episode {episode_idx}...")
                     for idx, traj in enumerate(ds.as_numpy_iterator()):
                         if idx == episode_idx:
                             episode_cache[episode_id] = traj
+                            print(f"    Found episode {episode_idx}")
+                            break
+                        if idx > episode_idx:
+                            print(f"    Episode {episode_idx} not found (stopped at {idx})")
                             break
                 else:
                     print(f"  Example {ex_idx+1}: Could not parse episode_id {episode_id}")
                     continue
-            else:
-                traj = episode_cache[episode_id]
+            
+            if episode_id not in episode_cache:
+                print(f"  Example {ex_idx+1}: Episode {episode_id} not found in cache")
+                continue
+            
+            traj = episode_cache[episode_id]
             
             img = extract_image_from_trajectory(traj, frame_index)
             
