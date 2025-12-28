@@ -127,9 +127,27 @@ class GeometricExtractor:
     def _load_model(self, config_path: str, checkpoint_path: str):
         """Load GroundingDINO model."""
         try:
-            from GroundingDINO.groundingdino.models import build_model
-            from GroundingDINO.groundingdino.util.slconfig import SLConfig
-            from GroundingDINO.groundingdino.util.utils import clean_state_dict
+            # Try importing with lowercase first (when installed via pip)
+            try:
+                from groundingdino.models import build_model
+                from groundingdino.util.slconfig import SLConfig
+                from groundingdino.util.utils import clean_state_dict
+            except ImportError:
+                # Fallback: try adding GroundingDINO to path if it exists but isn't installed
+                import sys
+                from pathlib import Path
+                possible_paths = [
+                    Path("/sc-cbint-vol/GroundingDINO"),
+                    Path(config_path).parent.parent.parent if config_path else None,
+                ]
+                for gd_path in possible_paths:
+                    if gd_path and gd_path.exists() and str(gd_path) not in sys.path:
+                        sys.path.insert(0, str(gd_path))
+                        break
+                
+                from GroundingDINO.groundingdino.models import build_model
+                from GroundingDINO.groundingdino.util.slconfig import SLConfig
+                from GroundingDINO.groundingdino.util.utils import clean_state_dict
             
             args = SLConfig.fromfile(config_path)
             args.device = self.device
@@ -201,7 +219,12 @@ class GeometricExtractor:
             return [], None
         
         try:
-            from GroundingDINO.groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
+            # Try lowercase first (when installed via pip)
+            try:
+                from groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
+            except ImportError:
+                # Fallback: try uppercase path
+                from GroundingDINO.groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
             
             transform = Compose([
                 Resize([800], max_size=1333),
