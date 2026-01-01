@@ -535,7 +535,7 @@ def mine_concepts_pass_b(
 
 def main():
     parser = argparse.ArgumentParser(description="Mine concepts from RLDS datasets")
-    parser.add_argument("--pass", type=str, choices=["a", "b", "ab"], default="a",
+    parser.add_argument("--pass", type=str, choices=["a", "b", "ab"], default="a", dest="pass_type",
                        help="Which pass to run: 'a' (proprioceptive), 'b' (geometric), 'ab' (both)")
     parser.add_argument("--dataset_name", type=str, required=True, help="RLDS dataset name")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing RLDS data")
@@ -555,25 +555,25 @@ def main():
     
     train = not args.val
     
-    if args.pass in ["a", "ab"]:
+    if args.pass_type in ["a", "ab"]:
         mine_concepts_pass_a(
             dataset_name=args.dataset_name,
             data_dir=Path(args.data_dir),
-            output_path=Path(args.output_path) if args.pass == "a" else Path(args.output_path) / "pass_a",
+            output_path=Path(args.output_path) if args.pass_type == "a" else Path(args.output_path) / "pass_a",
             train=train,
             gripper_closed_threshold=args.gripper_closed_threshold,
             arm_moving_epsilon=args.arm_moving_epsilon,
             table_height=args.table_height,
         )
     
-    if args.pass in ["b", "ab"]:
+    if args.pass_type in ["b", "ab"]:
         pass_a_path = Path(args.pass_a_concepts_path) if args.pass_a_concepts_path else (
-            Path(args.output_path) / "pass_a" if args.pass == "ab" else None
+            Path(args.output_path) / "pass_a" if args.pass_type == "ab" else None
         )
         mine_concepts_pass_b(
             dataset_name=args.dataset_name,
             data_dir=Path(args.data_dir),
-            output_path=Path(args.output_path) if args.pass == "b" else Path(args.output_path) / "pass_b",
+            output_path=Path(args.output_path) if args.pass_type == "b" else Path(args.output_path) / "pass_b",
             train=train,
             confidence_threshold=args.confidence_threshold,
             alignment_pixel_threshold=args.alignment_pixel_threshold,
