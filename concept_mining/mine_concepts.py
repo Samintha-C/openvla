@@ -433,6 +433,9 @@ def mine_concepts_pass_b(
     skipped_no_obs = 0
     skipped_no_img = 0
     skipped_no_lang = 0
+    skipped_empty_instruction = 0
+    
+    print("Starting Pass B iteration...", flush=True)
     
     for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
         if "observation" not in traj:
@@ -516,8 +519,9 @@ def mine_concepts_pass_b(
                     frame_instruction = str(frame_inst) if frame_inst else ""
             
             if not frame_instruction or len(frame_instruction.strip()) == 0:
+                skipped_empty_instruction += 1
                 if traj_idx < 3 and frame_idx == 0:
-                    print(f"DEBUG: Empty instruction for trajectory {traj_idx}, frame {frame_idx}")
+                    print(f"DEBUG: Empty instruction for trajectory {traj_idx}, frame {frame_idx}", flush=True)
                 continue
             
             concepts = extractor.extract(
@@ -526,14 +530,17 @@ def mine_concepts_pass_b(
                 proprio=proprio_frame,
             )
             
-            if traj_idx < 3 and frame_idx == 0:
-                print(f"DEBUG: Trajectory {traj_idx}, Frame {frame_idx}")
-                print(f"  Instruction: {frame_instruction[:100] if len(frame_instruction) > 100 else frame_instruction}")
-                print(f"  Concepts: {concepts}")
-                print(f"  Image shape: {img.size if img else 'None'}")
-                print(f"  Proprio available: {proprio_frame is not None}")
+            if traj_idx < 5 and frame_idx == 0:
+                import sys
+                sys.stdout.flush()
+                print(f"DEBUG: Trajectory {traj_idx}, Frame {frame_idx}", flush=True)
+                print(f"  Instruction: {frame_instruction[:100] if len(frame_instruction) > 100 else frame_instruction}", flush=True)
+                print(f"  Concepts: {concepts}", flush=True)
+                print(f"  Image shape: {img.size if img else 'None'}", flush=True)
+                print(f"  Proprio available: {proprio_frame is not None}", flush=True)
                 noun_phrases = extractor.extract_noun_phrases(frame_instruction)
-                print(f"  Extracted noun phrases: {noun_phrases}")
+                print(f"  Extracted noun phrases: {noun_phrases}", flush=True)
+                print(f"  Concept sum: {sum(concepts.values())}", flush=True)
             
             concept_record = {
                 "dataset_name": dataset_name,
@@ -545,16 +552,23 @@ def mine_concepts_pass_b(
             frames_with_concepts += 1
         
         if traj_idx == 0:
-            print(f"DEBUG: First trajectory: {frames_with_concepts}/{num_frames} frames had images")
+            import sys
+            sys.stdout.flush()
+            print(f"DEBUG: First trajectory: {frames_with_concepts}/{num_frames} frames had images", flush=True)
+            print(f"  Skipped - no obs: {skipped_no_obs}, no lang: {skipped_no_lang}, no img: {skipped_no_img}", flush=True)
         
         if (traj_idx + 1) % 10 == 0:
-            print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records")
+            import sys
+            sys.stdout.flush()
+            print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records", flush=True)
+            print(f"  Skipped - no obs: {skipped_no_obs}, no lang: {skipped_no_lang}, no img: {skipped_no_img}", flush=True)
             print(f"  Skipped: {skipped_no_obs} no obs, {skipped_no_img} no img, {skipped_no_lang} no lang")
     
-    print(f"\nTotal concept records: {len(all_concept_records)}")
-    print(f"Skipped - no observation: {skipped_no_obs}")
-    print(f"Skipped - no language: {skipped_no_lang}")
-    print(f"Skipped - no image: {skipped_no_img}")
+    print(f"\nTotal concept records: {len(all_concept_records)}", flush=True)
+    print(f"Skipped - no observation: {skipped_no_obs}", flush=True)
+    print(f"Skipped - no language: {skipped_no_lang}", flush=True)
+    print(f"Skipped - no image: {skipped_no_img}", flush=True)
+    print(f"Skipped - empty instruction: {skipped_empty_instruction}", flush=True)
     
     if len(all_concept_records) == 0:
         print("No concept records extracted. Exiting.")
