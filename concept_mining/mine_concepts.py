@@ -430,43 +430,110 @@ def mine_concepts_pass_b(
         return
     
     all_concept_records = []
+    skipped_no_obs = 0
+    skipped_no_img = 0
+    skipped_no_lang = 0
     
     for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
         if "observation" not in traj:
-            continue
-        
-        if "proprio" not in traj["observation"]:
+            skipped_no_obs += 1
             continue
         
         if "task" not in traj or "language_instruction" not in traj["task"]:
+            skipped_no_lang += 1
             continue
         
-        instruction = traj["task"]["language_instruction"]
-        if isinstance(instruction, bytes):
-            instruction = instruction.decode("utf-8")
-        elif isinstance(instruction, np.ndarray):
-            instruction = str(instruction[0]) if len(instruction) > 0 else ""
+        instruction_raw = traj["task"]["language_instruction"]
+        if isinstance(instruction_raw, tf.Tensor):
+            instruction_raw = instruction_raw.numpy()
         
-        proprio = traj["observation"]["proprio"]
-        if isinstance(proprio, tf.Tensor):
-            proprio = proprio.numpy()
+        if isinstance(instruction_raw, bytes):
+            instruction = instruction_raw.decode("utf-8")
+        elif isinstance(instruction_raw, np.ndarray):
+            if len(instruction_raw.shape) == 0:
+                instruction = str(instruction_raw)
+            else:
+                instruction = str(instruction_raw[0]) if len(instruction_raw) > 0 else ""
+        else:
+            instruction = str(instruction_raw) if instruction_raw else ""
         
-        num_frames = len(proprio) if len(proprio.shape) > 1 else 1
+        obs = traj["observation"]
+        
+        if "image_primary" not in obs:
+            skipped_no_img += 1
+            if traj_idx == 0:
+                print(f"DEBUG: No image_primary in trajectory 0")
+                print(f"  Observation keys: {list(obs.keys())}")
+            continue
+        
+        image_primary = obs["image_primary"]
+        if isinstance(image_primary, tf.Tensor):
+            image_primary = image_primary.numpy()
+        
+        num_frames = len(image_primary) if len(image_primary.shape) > 3 else 1
         
         episode_id = f"{dataset_name}_episode_{traj_idx:06d}"
         
+        proprio_data = None
+        if "proprio" in obs:
+            proprio_data = obs["proprio"]
+            if isinstance(proprio_data, tf.Tensor):
+                proprio_data = proprio_data.numpy()
+        
+        frames_with_concepts = 0
         for frame_idx in range(num_frames):
-            proprio_frame = proprio[frame_idx] if len(proprio.shape) > 1 else proprio
-            
             img = extract_image_from_trajectory(traj, frame_idx)
             if img is None:
+                skipped_no_img += 1
+                if traj_idx < 3 and frame_idx == 0:
+                    print(f"DEBUG: No image extracted from trajectory {traj_idx}, frame {frame_idx}")
+                    print(f"  Observation keys: {list(obs.keys())}")
+                    if "image_primary" in obs:
+                        img_data = obs["image_primary"]
+                        if isinstance(img_data, tf.Tensor):
+                            img_data = img_data.numpy()
+                        print(f"  image_primary shape: {img_data.shape if hasattr(img_data, 'shape') else type(img_data)}")
+                continue
+            
+            proprio_frame = None
+            if proprio_data is not None:
+                if len(proprio_data.shape) > 1:
+                    proprio_frame = proprio_data[frame_idx] if frame_idx < len(proprio_data) else None
+                else:
+                    proprio_frame = proprio_data
+            
+            frame_instruction = instruction
+            if isinstance(instruction_raw, np.ndarray) and len(instruction_raw.shape) > 0 and len(instruction_raw) > frame_idx:
+                frame_inst = instruction_raw[frame_idx]
+                if isinstance(frame_inst, bytes):
+                    frame_instruction = frame_inst.decode("utf-8")
+                elif isinstance(frame_inst, np.ndarray):
+                    if len(frame_inst.shape) == 0:
+                        frame_instruction = str(frame_inst)
+                    else:
+                        frame_instruction = str(frame_inst[0]) if len(frame_inst) > 0 else ""
+                else:
+                    frame_instruction = str(frame_inst) if frame_inst else ""
+            
+            if not frame_instruction or len(frame_instruction.strip()) == 0:
+                if traj_idx < 3 and frame_idx == 0:
+                    print(f"DEBUG: Empty instruction for trajectory {traj_idx}, frame {frame_idx}")
                 continue
             
             concepts = extractor.extract(
                 image=img,
-                instruction=instruction,
+                instruction=frame_instruction,
                 proprio=proprio_frame,
             )
+            
+            if traj_idx < 3 and frame_idx == 0:
+                print(f"DEBUG: Trajectory {traj_idx}, Frame {frame_idx}")
+                print(f"  Instruction: {frame_instruction[:100] if len(frame_instruction) > 100 else frame_instruction}")
+                print(f"  Concepts: {concepts}")
+                print(f"  Image shape: {img.size if img else 'None'}")
+                print(f"  Proprio available: {proprio_frame is not None}")
+                noun_phrases = extractor.extract_noun_phrases(frame_instruction)
+                print(f"  Extracted noun phrases: {noun_phrases}")
             
             concept_record = {
                 "dataset_name": dataset_name,
@@ -475,11 +542,19 @@ def mine_concepts_pass_b(
                 "concepts": concepts,
             }
             all_concept_records.append(concept_record)
+            frames_with_concepts += 1
+        
+        if traj_idx == 0:
+            print(f"DEBUG: First trajectory: {frames_with_concepts}/{num_frames} frames had images")
         
         if (traj_idx + 1) % 10 == 0:
             print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records")
+            print(f"  Skipped: {skipped_no_obs} no obs, {skipped_no_img} no img, {skipped_no_lang} no lang")
     
-    print(f"Total concept records: {len(all_concept_records)}")
+    print(f"\nTotal concept records: {len(all_concept_records)}")
+    print(f"Skipped - no observation: {skipped_no_obs}")
+    print(f"Skipped - no language: {skipped_no_lang}")
+    print(f"Skipped - no image: {skipped_no_img}")
     
     if len(all_concept_records) == 0:
         print("No concept records extracted. Exiting.")
