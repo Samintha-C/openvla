@@ -222,26 +222,30 @@ class GeometricExtractor:
             return [], None
         
         try:
-            # Use the same import path that was used during model loading
-            if self._groundingdino_module_prefix == "groundingdino":
-                from groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
-            elif self._groundingdino_module_prefix == "GroundingDINO.groundingdino":
-                from GroundingDINO.groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
-            else:
-                # Fallback: try both
-                try:
-                    from groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
-                except ImportError:
-                    from GroundingDINO.groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
+            # Use torchvision transforms for preprocessing (more reliable than GroundingDINO-specific transforms)
+            from torchvision import transforms as T
+            import torch.nn.functional as F
             
-            transform = Compose([
-                Resize([800], max_size=1333),
-                Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                ToTensor(),
+            # GroundingDINO expects images resized to max 800px with max_size 1333
+            # Resize to 800px on shorter side, keeping aspect ratio
+            w, h = image.size
+            if h < w:
+                new_h, new_w = 800, int(800 * w / h)
+            else:
+                new_h, new_w = int(800 * h / w), 800
+            
+            # Ensure max dimension doesn't exceed 1333
+            if max(new_h, new_w) > 1333:
+                scale = 1333 / max(new_h, new_w)
+                new_h, new_w = int(new_h * scale), int(new_w * scale)
+            
+            transform = T.Compose([
+                T.Resize((new_h, new_w)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
             
-            image_tensor, _ = transform(image, None)
-            image_tensor = image_tensor.unsqueeze(0).to(self.device)
+            image_tensor = transform(image).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
                 outputs = self.model(image_tensor, captions=[prompt])
