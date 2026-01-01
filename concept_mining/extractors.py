@@ -148,9 +148,13 @@ class GeometricExtractor:
                 self.model = None
                 return
             
-            args = self.gdino_SLConfig.fromfile(config_file)
-            args.device = self.device
-            model = self.gdino_load_model(args, weights_path)
+            if not Path(config_file).exists():
+                print(f"Warning: GroundingDINO config file not found at {config_file}")
+                self.model = None
+                return
+            
+            model = self.gdino_load_model(config_file, weights_path)
+            model = model.to(self.device)
             model.eval()
             self.model = model
             self.transform = T.Compose([
