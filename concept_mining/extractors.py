@@ -120,6 +120,7 @@ class GeometricExtractor:
         self.device = device
         self.model = None
         self.tokenizer = None
+        self._groundingdino_module_prefix = None
         
         if model_config_path and model_checkpoint_path:
             self._load_model(model_config_path, model_checkpoint_path)
@@ -132,6 +133,7 @@ class GeometricExtractor:
                 from groundingdino.models import build_model
                 from groundingdino.util.slconfig import SLConfig
                 from groundingdino.util.utils import clean_state_dict
+                self._groundingdino_module_prefix = "groundingdino"
             except ImportError:
                 # Fallback: try adding GroundingDINO to path if it exists but isn't installed
                 import sys
@@ -148,6 +150,7 @@ class GeometricExtractor:
                 from GroundingDINO.groundingdino.models import build_model
                 from GroundingDINO.groundingdino.util.slconfig import SLConfig
                 from GroundingDINO.groundingdino.util.utils import clean_state_dict
+                self._groundingdino_module_prefix = "GroundingDINO.groundingdino"
             
             args = SLConfig.fromfile(config_path)
             args.device = self.device
@@ -219,12 +222,17 @@ class GeometricExtractor:
             return [], None
         
         try:
-            # Try lowercase first (when installed via pip)
-            try:
+            # Use the same import path that was used during model loading
+            if self._groundingdino_module_prefix == "groundingdino":
                 from groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
-            except ImportError:
-                # Fallback: try uppercase path
+            elif self._groundingdino_module_prefix == "GroundingDINO.groundingdino":
                 from GroundingDINO.groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
+            else:
+                # Fallback: try both
+                try:
+                    from groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
+                except ImportError:
+                    from GroundingDINO.groundingdino.datasets.transforms import Compose, Normalize, Resize, ToTensor
             
             transform = Compose([
                 Resize([800], max_size=1333),
