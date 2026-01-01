@@ -222,6 +222,21 @@ class GeometricExtractor:
             return [], None
         
         try:
+            # Check if C++ extensions are available by trying to import the module
+            try:
+                import importlib
+                if self._groundingdino_module_prefix == "groundingdino":
+                    ms_deform_attn_module = importlib.import_module("groundingdino.models.GroundingDINO.ms_deform_attn")
+                else:
+                    ms_deform_attn_module = importlib.import_module("GroundingDINO.groundingdino.models.GroundingDINO.ms_deform_attn")
+                
+                # Check if MSDeformAttn class exists (it won't if C++ extensions failed)
+                if not hasattr(ms_deform_attn_module, 'MSDeformAttn'):
+                    # C++ extensions not compiled, return empty detections
+                    return [], None
+            except (ImportError, AttributeError):
+                # Can't check, but try anyway
+                pass
             # Use torchvision transforms for preprocessing (more reliable than GroundingDINO-specific transforms)
             from torchvision import transforms as T
             import torch.nn.functional as F
@@ -248,7 +263,14 @@ class GeometricExtractor:
             image_tensor = transform(image).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
-                outputs = self.model(image_tensor, captions=[prompt])
+                try:
+                    outputs = self.model(image_tensor, captions=[prompt])
+                except (NameError, RuntimeError, AttributeError) as e:
+                    error_str = str(e)
+                    if "'_C'" in error_str or "_C" in error_str or "C++ ops" in error_str:
+                        # C++ extensions not available, return empty detections
+                        return [], None
+                    raise
             
             logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
             boxes = outputs["pred_boxes"][0]  # (nq, 4)
