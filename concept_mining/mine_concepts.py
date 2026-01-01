@@ -7,7 +7,6 @@ import tensorflow as tf
 import dlimp as dl
 from datasets import Dataset
 from tqdm import tqdm
-import torch
 
 import sys
 from pathlib import Path
@@ -17,8 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import os
 USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
 
-# TensorFlow GPU setup (only affects Pass A)
-# Note: Pass B (GroundingDINO) uses PyTorch and will automatically detect GPU
 if USE_GPU:
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
@@ -26,28 +23,26 @@ if USE_GPU:
             tf.config.set_visible_devices(gpus, "GPU")
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"TensorFlow GPU enabled: {len(gpus)} device(s)")
-            print(f"TensorFlow GPU devices: {[gpu.name for gpu in gpus]}")
+            print(f"GPU enabled: {len(gpus)} device(s)")
+            print(f"GPU devices: {[gpu.name for gpu in gpus]}")
         except RuntimeError as e:
-            print(f"TensorFlow GPU configuration error: {e}")
+            print(f"GPU configuration error: {e}")
             gpus = []
             USE_GPU = False
     else:
-        print("No TensorFlow GPU devices found")
+        print("No GPU devices found, using CPU")
         USE_GPU = False
         gpus = []
 else:
     tf.config.set_visible_devices([], "GPU")
     gpus = []
-    # Only print this if we're actually running Pass A
-    # (We'll check pass_type in main() and print there if needed)
+    print("GPU disabled (USE_GPU=false), using CPU only")
 
 from prismatic.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, StateEncoding
 from prismatic.vla.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
 from prismatic.vla.datasets.rlds.oxe.materialize import make_oxe_dataset_kwargs
 from prismatic.vla.datasets.rlds.dataset import make_dataset_from_rlds
 from concept_mining.extractors import ProprioceptiveExtractor, GeometricExtractor
-from PIL import Image
 
 if gpus:
     try:
@@ -130,7 +125,7 @@ def extract_concepts_batch_gpu(
     }
 
 
-def extract_concepts_from_trajectory(
+def extract_concepts_from_trajectory_pass_a(
     traj: Dict[str, Any],
     dataset_name: str,
     episode_idx: int,
@@ -304,7 +299,7 @@ def mine_concepts_pass_a(
             continue
         
         try:
-            concept_records = extract_concepts_from_trajectory(
+            concept_records = extract_concepts_from_trajectory_pass_a(
                 traj, dataset_name, traj_idx, extractor, use_gpu=use_gpu
             )
             if use_gpu and len(gpus) > 0:
@@ -314,7 +309,7 @@ def mine_concepts_pass_a(
         except Exception as e:
             print(f"Error extracting concepts from trajectory {traj_idx}: {e}")
             cpu_fallback_count += 1
-            concept_records = extract_concepts_from_trajectory(
+            concept_records = extract_concepts_from_trajectory_pass_a(
                 traj, dataset_name, traj_idx, extractor, use_gpu=False
             )
         
@@ -342,16 +337,97 @@ def mine_concepts_pass_a(
         print(f"Sample record: {concept_dataset[0]}")
 
 
+def extract_concepts_from_trajectory_pass_b(
+    traj: Dict[str, Any],
+    dataset_name: str,
+    episode_idx: int,
+    geometric_extractor: GeometricExtractor,
+) -> List[Dict[str, Any]]:
+    """
+    Extract Pass B (geometric) concepts from a trajectory.
+    
+    Returns:
+        List of concept dictionaries, one per frame
+    """
+    concept_records = []
+    
+    if "observation" not in traj:
+        return concept_records
+    
+    obs = traj["observation"]
+    
+    images = None
+    if "image" in obs:
+        images_dict = obs["image"]
+        if isinstance(images_dict, dict):
+            images = list(images_dict.values())[0] if images_dict else None
+        else:
+            images = images_dict
+    elif "image_primary" in obs:
+        images = obs["image_primary"]
+    
+    if images is None:
+        return concept_records
+    
+    instruction = None
+    if "task" in traj and "language_instruction" in traj["task"]:
+        instruction = traj["task"]["language_instruction"]
+        if isinstance(instruction, (bytes, tf.Tensor)):
+            if isinstance(instruction, tf.Tensor):
+                instruction = instruction.numpy()
+            if isinstance(instruction, bytes):
+                instruction = instruction.decode("utf-8")
+            else:
+                instruction = str(instruction)
+        instruction = str(instruction).strip()
+    
+    if not instruction:
+        return concept_records
+    
+    if isinstance(images, tf.Tensor):
+        images_np = images.numpy()
+    else:
+        images_np = np.array(images)
+    
+    if len(images_np.shape) == 4:
+        traj_len = images_np.shape[0]
+    elif len(images_np.shape) == 3:
+        traj_len = 1
+        images_np = images_np[None]
+    else:
+        return concept_records
+    
+    episode_id = f"{dataset_name}_episode_{episode_idx:06d}"
+    
+    for frame_idx in range(traj_len):
+        img = images_np[frame_idx]
+        if img.dtype != np.uint8:
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = img.astype(np.uint8)
+        
+        geometric_concepts = geometric_extractor.extract(img, instruction)
+        
+        concept_record = {
+            "dataset_name": dataset_name,
+            "episode_id": episode_id,
+            "frame_index": int(frame_idx),
+            "concepts": geometric_concepts,
+        }
+        concept_records.append(concept_record)
+    
+    return concept_records
+
+
 def mine_concepts_pass_b(
     dataset_name: str,
     data_dir: Path,
     output_path: Path,
     train: bool = True,
-    groundingdino_config: Optional[str] = None,
-    groundingdino_checkpoint: Optional[str] = None,
-    text_threshold: float = 0.25,
-    box_threshold: float = 0.3,
-    alignment_pixel_threshold: float = 50.0,
+    confidence_threshold: float = 0.3,
+    alignment_pixel_threshold: int = 50,
+    pass_a_concepts_path: Optional[Path] = None,
 ):
     """
     Mine Pass B (geometric) concepts from RLDS dataset using GroundingDINO.
@@ -361,26 +437,11 @@ def mine_concepts_pass_b(
         data_dir: Directory containing RLDS data
         output_path: Path to save the concept dataset
         train: Whether to use train or validation split
-        groundingdino_config: Path to GroundingDINO config file
-        groundingdino_checkpoint: Path to GroundingDINO checkpoint
-        text_threshold: Threshold for text matching confidence
-        box_threshold: Threshold for bounding box confidence
+        confidence_threshold: GroundingDINO confidence threshold
         alignment_pixel_threshold: Pixel distance threshold for alignment
+        pass_a_concepts_path: Optional path to Pass A concepts to merge
     """
     print(f"Mining Pass B (geometric) concepts from {dataset_name} (split={'train' if train else 'val'})...")
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if torch.cuda.is_available():
-        print(f"PyTorch GPU available: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA version: {torch.version.cuda}")
-    else:
-        print("PyTorch GPU not available, using CPU")
-    
-    if not groundingdino_config or not groundingdino_checkpoint:
-        print("Error: GroundingDINO config and checkpoint paths are required for Pass B")
-        print("Install GroundingDINO: git clone https://github.com/IDEA-Research/GroundingDINO")
-        print("Download checkpoint: wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth")
-        return
     
     oxe_dataset_name = TFDS_TO_OXE_NAME_MAP.get(dataset_name, dataset_name)
     dataset_config = OXE_DATASET_CONFIGS.get(oxe_dataset_name)
@@ -389,19 +450,18 @@ def mine_concepts_pass_b(
         raise ValueError(
             f"Unknown dataset: {dataset_name}. "
             f"Available OXE datasets include: {', '.join(available)}... "
+            f"(Total: {len(OXE_DATASET_CONFIGS)})."
         )
     
-    extractor = GeometricExtractor(
-        model_config_path=groundingdino_config,
-        model_checkpoint_path=groundingdino_checkpoint,
-        text_threshold=text_threshold,
-        box_threshold=box_threshold,
+    print(f"Using OXE config name: {oxe_dataset_name}")
+    
+    geometric_extractor = GeometricExtractor(
+        confidence_threshold=confidence_threshold,
         alignment_pixel_threshold=alignment_pixel_threshold,
-        device=device,
     )
     
-    if extractor.model is None:
-        print("Failed to load GroundingDINO model. Exiting.")
+    if geometric_extractor.model is None:
+        print("Error: GroundingDINO model not available. Cannot proceed with Pass B.")
         return
     
     dataset_kwargs = make_oxe_dataset_kwargs(
@@ -409,18 +469,17 @@ def mine_concepts_pass_b(
         data_root_dir=data_dir,
         load_camera_views=("primary",),
         load_depth=False,
-        load_proprio=True,
+        load_proprio=False,
         load_language=True,
     )
-    
     dataset_kwargs["name"] = dataset_name
     
     try:
         ds, _ = make_dataset_from_rlds(
             train=train,
             shuffle=False,
-            num_parallel_reads=1,
-            num_parallel_calls=1,
+            num_parallel_reads=tf.data.AUTOTUNE,
+            num_parallel_calls=tf.data.AUTOTUNE,
             **dataset_kwargs,
         )
     except Exception as e:
@@ -430,165 +489,38 @@ def mine_concepts_pass_b(
         return
     
     all_concept_records = []
-    skipped_no_obs = 0
-    skipped_no_img = 0
-    skipped_no_lang = 0
-    skipped_empty_instruction = 0
     
-    print("Starting Pass B iteration...", flush=True)
-    
+    print(f"Iterating through trajectories...")
     for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
         if "observation" not in traj:
-            skipped_no_obs += 1
             continue
         
-        if "task" not in traj or "language_instruction" not in traj["task"]:
-            skipped_no_lang += 1
-            continue
+        concept_records = extract_concepts_from_trajectory_pass_b(
+            traj, dataset_name, traj_idx, geometric_extractor
+        )
+        all_concept_records.extend(concept_records)
         
-        instruction_raw = traj["task"]["language_instruction"]
-        if isinstance(instruction_raw, tf.Tensor):
-            instruction_raw = instruction_raw.numpy()
-        
-        if isinstance(instruction_raw, bytes):
-            instruction = instruction_raw.decode("utf-8")
-        elif isinstance(instruction_raw, np.ndarray):
-            if len(instruction_raw.shape) == 0:
-                instruction = str(instruction_raw)
-            else:
-                instruction = str(instruction_raw[0]) if len(instruction_raw) > 0 else ""
-        else:
-            instruction = str(instruction_raw) if instruction_raw else ""
-        
-        obs = traj["observation"]
-        
-        if "image_primary" not in obs:
-            skipped_no_img += 1
-            if traj_idx == 0:
-                print(f"DEBUG: No image_primary in trajectory 0")
-                print(f"  Observation keys: {list(obs.keys())}")
-            continue
-        
-        image_primary = obs["image_primary"]
-        if isinstance(image_primary, tf.Tensor):
-            image_primary = image_primary.numpy()
-        
-        num_frames = len(image_primary) if len(image_primary.shape) > 3 else 1
-        
-        episode_id = f"{dataset_name}_episode_{traj_idx:06d}"
-        
-        proprio_data = None
-        if "proprio" in obs:
-            proprio_data = obs["proprio"]
-            if isinstance(proprio_data, tf.Tensor):
-                proprio_data = proprio_data.numpy()
-        
-        frames_with_concepts = 0
-        for frame_idx in range(num_frames):
-            debug_img = (traj_idx < 3 and frame_idx == 0)
-            img = extract_image_from_trajectory(traj, frame_idx, debug=debug_img)
-            if img is None:
-                skipped_no_img += 1
-                if debug_img:
-                    print(f"DEBUG: No image extracted from trajectory {traj_idx}, frame {frame_idx}", flush=True)
-                    print(f"  Observation keys: {list(obs.keys())}", flush=True)
-                    if "image_primary" in obs:
-                        img_data = obs["image_primary"]
-                        if isinstance(img_data, tf.Tensor):
-                            img_data = img_data.numpy()
-                        print(f"  image_primary shape: {img_data.shape if hasattr(img_data, 'shape') else type(img_data)}", flush=True)
-                        print(f"  image_primary dtype: {img_data.dtype if hasattr(img_data, 'dtype') else 'N/A'}", flush=True)
-                        print(f"  num_frames: {num_frames}, frame_idx: {frame_idx}", flush=True)
-                continue
-            
-            proprio_frame = None
-            if proprio_data is not None:
-                if len(proprio_data.shape) > 1:
-                    proprio_frame = proprio_data[frame_idx] if frame_idx < len(proprio_data) else None
-                else:
-                    proprio_frame = proprio_data
-            
-            frame_instruction = instruction
-            if isinstance(instruction_raw, np.ndarray) and len(instruction_raw.shape) > 0 and len(instruction_raw) > frame_idx:
-                frame_inst = instruction_raw[frame_idx]
-                if isinstance(frame_inst, bytes):
-                    frame_instruction = frame_inst.decode("utf-8")
-                elif isinstance(frame_inst, np.ndarray):
-                    if len(frame_inst.shape) == 0:
-                        frame_instruction = str(frame_inst)
-                    else:
-                        frame_instruction = str(frame_inst[0]) if len(frame_inst) > 0 else ""
-                else:
-                    frame_instruction = str(frame_inst) if frame_inst else ""
-            
-            if not frame_instruction or len(frame_instruction.strip()) == 0:
-                skipped_empty_instruction += 1
-                if traj_idx < 3 and frame_idx == 0:
-                    print(f"DEBUG: Empty instruction for trajectory {traj_idx}, frame {frame_idx}", flush=True)
-                continue
-            
-            concepts = extractor.extract(
-                image=img,
-                instruction=frame_instruction,
-                proprio=proprio_frame,
-            )
-            
-            if traj_idx < 5 and frame_idx == 0:
-                import sys
-                sys.stdout.flush()
-                print(f"DEBUG: Trajectory {traj_idx}, Frame {frame_idx}", flush=True)
-                print(f"  Instruction: {frame_instruction[:100] if len(frame_instruction) > 100 else frame_instruction}", flush=True)
-                print(f"  Concepts: {concepts}", flush=True)
-                print(f"  Image shape: {img.size if img else 'None'}", flush=True)
-                print(f"  Proprio available: {proprio_frame is not None}", flush=True)
-                noun_phrases = extractor.extract_noun_phrases(frame_instruction)
-                print(f"  Extracted noun phrases: {noun_phrases}", flush=True)
-                print(f"  Concept sum: {sum(concepts.values())}", flush=True)
-            
-            concept_record = {
-                "dataset_name": dataset_name,
-                "episode_id": episode_id,
-                "frame_index": int(frame_idx),
-                "concepts": concepts,
-            }
-            all_concept_records.append(concept_record)
-            frames_with_concepts += 1
-        
-        if traj_idx == 0:
-            import sys
-            sys.stdout.flush()
-            print(f"DEBUG: First trajectory: {frames_with_concepts}/{num_frames} frames had images", flush=True)
-            print(f"  Skipped - no obs: {skipped_no_obs}, no lang: {skipped_no_lang}, no img: {skipped_no_img}", flush=True)
-        
-        if (traj_idx + 1) % 10 == 0:
-            import sys
-            sys.stdout.flush()
-            print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records", flush=True)
-            print(f"  Skipped - no obs: {skipped_no_obs}, no lang: {skipped_no_lang}, no img: {skipped_no_img}", flush=True)
-            print(f"  Skipped: {skipped_no_obs} no obs, {skipped_no_img} no img, {skipped_no_lang} no lang")
+        if (traj_idx + 1) % 100 == 0:
+            print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records")
     
-    print(f"\nTotal concept records: {len(all_concept_records)}", flush=True)
-    print(f"Skipped - no observation: {skipped_no_obs}", flush=True)
-    print(f"Skipped - no language: {skipped_no_lang}", flush=True)
-    print(f"Skipped - no image: {skipped_no_img}", flush=True)
-    print(f"Skipped - empty instruction: {skipped_empty_instruction}", flush=True)
-    
-    # Check concept statistics
-    if len(all_concept_records) > 0:
-        concept_sums = {}
-        for record in all_concept_records[:100]:  # Sample first 100
-            for concept_name, value in record["concepts"].items():
-                if concept_name not in concept_sums:
-                    concept_sums[concept_name] = 0.0
-                concept_sums[concept_name] += value
-        print(f"\nConcept statistics (first 100 records):", flush=True)
-        for concept_name, total in concept_sums.items():
-            avg = total / min(100, len(all_concept_records))
-            print(f"  {concept_name}: avg={avg:.3f}, total={total:.1f}", flush=True)
+    print(f"Total concept records: {len(all_concept_records)}")
     
     if len(all_concept_records) == 0:
         print("No concept records extracted. Exiting.")
         return
+    
+    if pass_a_concepts_path and pass_a_concepts_path.exists():
+        print(f"Merging with Pass A concepts from {pass_a_concepts_path}...")
+        pass_a_dataset = load_from_disk(str(pass_a_concepts_path))
+        pass_a_dict = {
+            (r["episode_id"], r["frame_index"]): r["concepts"]
+            for r in pass_a_dataset
+        }
+        
+        for record in all_concept_records:
+            key = (record["episode_id"], record["frame_index"])
+            if key in pass_a_dict:
+                record["concepts"].update(pass_a_dict[key])
     
     concept_dataset = Dataset.from_list(all_concept_records)
     
@@ -601,102 +533,9 @@ def mine_concepts_pass_b(
         print(f"Sample record: {concept_dataset[0]}")
 
 
-def extract_image_from_trajectory(traj, frame_idx, debug=False):
-    """Extract image from trajectory at specific frame index."""
-    if "observation" not in traj:
-        if debug:
-            print(f"  DEBUG extract_image: No 'observation' key in trajectory", flush=True)
-        return None
-    
-    obs = traj["observation"]
-    
-    img = None
-    img_key = None
-    if "image_primary" in obs:
-        img = obs["image_primary"]
-        img_key = "image_primary"
-    elif "image" in obs:
-        images = obs["image"]
-        if isinstance(images, dict):
-            img = images.get("primary") or list(images.values())[0]
-            img_key = "image[dict]"
-        else:
-            img = images
-            img_key = "image"
-    elif "rgb" in obs:
-        img = obs["rgb"]
-        img_key = "rgb"
-    
-    if img is None:
-        if debug:
-            print(f"  DEBUG extract_image: No image found. Available keys: {list(obs.keys())}", flush=True)
-        return None
-    
-    if isinstance(img, tf.Tensor):
-        img_np = img.numpy()
-    else:
-        img_np = np.array(img)
-    
-    if debug:
-        print(f"  DEBUG extract_image: Found {img_key}, shape: {img_np.shape if hasattr(img_np, 'shape') else 'N/A'}, dtype: {type(img_np)}", flush=True)
-    
-    if img_np.dtype == object or (isinstance(img_np, np.ndarray) and img_np.dtype.type is np.str_):
-        if debug:
-            print(f"  DEBUG extract_image: Image is encoded string, decoding...", flush=True)
-        if isinstance(img, tf.Tensor):
-            img_bytes = img.numpy()
-        else:
-            img_bytes = img_np
-        
-        if len(img_bytes.shape) > 0:
-            if frame_idx >= len(img_bytes):
-                if debug:
-                    print(f"  DEBUG extract_image: frame_idx {frame_idx} >= len {len(img_bytes)}", flush=True)
-                return None
-            img_bytes = img_bytes[frame_idx]
-        
-        if len(img_bytes) == 0:
-            if debug:
-                print(f"  DEBUG extract_image: Empty encoded image", flush=True)
-            return None
-        
-        try:
-            img_np = tf.io.decode_image(img_bytes, expand_animations=False, dtype=tf.uint8).numpy()
-        except Exception as e:
-            if debug:
-                print(f"  DEBUG extract_image: Error decoding image: {e}", flush=True)
-            return None
-    else:
-        if len(img_np.shape) == 4:
-            if frame_idx >= img_np.shape[0]:
-                if debug:
-                    print(f"  DEBUG extract_image: frame_idx {frame_idx} >= shape[0] {img_np.shape[0]}", flush=True)
-                return None
-            img_np = img_np[frame_idx]
-        elif len(img_np.shape) == 3:
-            img_np = img_np
-        else:
-            if debug:
-                print(f"  DEBUG extract_image: Unexpected shape {img_np.shape}, expected 3D or 4D", flush=True)
-            return None
-    
-    if img_np.dtype != np.uint8:
-        if img_np.max() <= 1.0:
-            img_np = (img_np * 255).astype(np.uint8)
-        else:
-            img_np = img_np.astype(np.uint8)
-    
-    try:
-        return Image.fromarray(img_np)
-    except Exception as e:
-        if debug:
-            print(f"  DEBUG extract_image: Error creating PIL Image: {e}", flush=True)
-        return None
-
-
 def main():
     parser = argparse.ArgumentParser(description="Mine concepts from RLDS datasets")
-    parser.add_argument("--pass_type", type=str, choices=["a", "b", "ab"], default="a",
+    parser.add_argument("--pass", type=str, choices=["a", "b", "ab"], default="a",
                        help="Which pass to run: 'a' (proprioceptive), 'b' (geometric), 'ab' (both)")
     parser.add_argument("--dataset_name", type=str, required=True, help="RLDS dataset name")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing RLDS data")
@@ -708,43 +547,37 @@ def main():
     parser.add_argument("--arm_moving_epsilon", type=float, default=0.01, help="Arm moving epsilon threshold (Pass A)")
     parser.add_argument("--table_height", type=float, default=0.0, help="Table height threshold (Pass A)")
     
-    parser.add_argument("--groundingdino_config", type=str, default=None,
-                       help="Path to GroundingDINO config file (Pass B)")
-    parser.add_argument("--groundingdino_checkpoint", type=str, default=None,
-                       help="Path to GroundingDINO checkpoint (Pass B)")
-    parser.add_argument("--text_threshold", type=float, default=0.25, help="Text threshold for GroundingDINO (Pass B)")
-    parser.add_argument("--box_threshold", type=float, default=0.3, help="Box threshold for GroundingDINO (Pass B)")
-    parser.add_argument("--alignment_pixel_threshold", type=float, default=50.0,
-                       help="Pixel distance threshold for alignment (Pass B)")
+    parser.add_argument("--confidence_threshold", type=float, default=0.3, help="GroundingDINO confidence threshold (Pass B)")
+    parser.add_argument("--alignment_pixel_threshold", type=int, default=50, help="Alignment pixel threshold (Pass B)")
+    parser.add_argument("--pass_a_concepts_path", type=str, default=None, help="Path to Pass A concepts to merge (Pass B)")
     
     args = parser.parse_args()
     
     train = not args.val
     
-    if args.pass_type in ["a", "ab"]:
-        output_path_a = Path(args.output_path) if args.pass_type == "a" else Path(args.output_path).with_suffix(".pass_a")
+    if args.pass in ["a", "ab"]:
         mine_concepts_pass_a(
             dataset_name=args.dataset_name,
             data_dir=Path(args.data_dir),
-            output_path=output_path_a,
+            output_path=Path(args.output_path) if args.pass == "a" else Path(args.output_path) / "pass_a",
             train=train,
             gripper_closed_threshold=args.gripper_closed_threshold,
             arm_moving_epsilon=args.arm_moving_epsilon,
             table_height=args.table_height,
         )
     
-    if args.pass_type in ["b", "ab"]:
-        output_path_b = Path(args.output_path) if args.pass_type == "b" else Path(args.output_path).with_suffix(".pass_b")
+    if args.pass in ["b", "ab"]:
+        pass_a_path = Path(args.pass_a_concepts_path) if args.pass_a_concepts_path else (
+            Path(args.output_path) / "pass_a" if args.pass == "ab" else None
+        )
         mine_concepts_pass_b(
             dataset_name=args.dataset_name,
             data_dir=Path(args.data_dir),
-            output_path=output_path_b,
+            output_path=Path(args.output_path) if args.pass == "b" else Path(args.output_path) / "pass_b",
             train=train,
-            groundingdino_config=args.groundingdino_config,
-            groundingdino_checkpoint=args.groundingdino_checkpoint,
-            text_threshold=args.text_threshold,
-            box_threshold=args.box_threshold,
+            confidence_threshold=args.confidence_threshold,
             alignment_pixel_threshold=args.alignment_pixel_threshold,
+            pass_a_concepts_path=pass_a_path,
         )
 
 

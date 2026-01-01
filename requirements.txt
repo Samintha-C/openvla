@@ -32,6 +32,14 @@ tqdm
 numpy
 seaborn
 
+# Pass B: Geometric concepts (GroundingDINO)
+# Note: GroundingDINO installation:
+# git clone https://github.com/IDEA-Research/GroundingDINO.git
+# cd GroundingDINO
+# pip install -e .
+# Download weights: https://github.com/IDEA-Research/GroundingDINO/releases
+pillow>=9.0.0
+
 # Optional: Flash Attention 2 (install separately with --no-build-isolation)
 # flash-attn==2.5.5
 

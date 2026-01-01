@@ -1,8 +1,15 @@
 import numpy as np
 from typing import Dict, Any, Optional, List, Tuple
+from pathlib import Path
 import re
-import torch
-from PIL import Image
+try:
+    import torch
+    from PIL import Image
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
+    Image = None
 
 
 class ProprioceptiveExtractor:
@@ -89,258 +96,129 @@ class ProprioceptiveExtractor:
 
 
 class GeometricExtractor:
-    """
-    Pass B: Geometric Concepts using GroundingDINO.
-    Extracts concepts about object visibility and gripper alignment.
-    """
-    
     def __init__(
         self,
-        model_config_path: Optional[str] = None,
-        model_checkpoint_path: Optional[str] = None,
-        text_threshold: float = 0.25,
-        box_threshold: float = 0.3,
-        alignment_pixel_threshold: float = 50.0,
-        device: str = "cuda",
+        confidence_threshold: float = 0.3,
+        alignment_pixel_threshold: int = 50,
+        device: Optional[str] = None,
     ):
         """
-        Initialize GroundingDINO-based geometric extractor.
+        Extract geometric concepts using GroundingDINO.
         
         Args:
-            model_config_path: Path to GroundingDINO config file
-            model_checkpoint_path: Path to GroundingDINO checkpoint
-            text_threshold: Threshold for text matching confidence
-            box_threshold: Threshold for bounding box confidence
-            alignment_pixel_threshold: Pixel distance threshold for gripper-target alignment
-            device: Device to run model on
+            confidence_threshold: Minimum confidence for object detection
+            alignment_pixel_threshold: Maximum pixel distance for alignment
+            device: Device to run GroundingDINO on
         """
-        self.text_threshold = text_threshold
-        self.box_threshold = box_threshold
+        self.confidence_threshold = confidence_threshold
         self.alignment_pixel_threshold = alignment_pixel_threshold
-        self.device = device
+        if device is None:
+            self.device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
         self.model = None
-        self.tokenizer = None
-        self._groundingdino_module_prefix = None
-        
-        if model_config_path and model_checkpoint_path:
-            self._load_model(model_config_path, model_checkpoint_path)
+        self._load_model()
     
-    def _load_model(self, config_path: str, checkpoint_path: str):
+    def _load_model(self):
         """Load GroundingDINO model."""
+        if not TORCH_AVAILABLE:
+            print("Warning: PyTorch not available. GroundingDINO requires PyTorch.")
+            self.model = None
+            return
+        
         try:
-            # Try importing with lowercase first (when installed via pip)
-            try:
-                from groundingdino.models import build_model
-                from groundingdino.util.slconfig import SLConfig
-                from groundingdino.util.utils import clean_state_dict
-                self._groundingdino_module_prefix = "groundingdino"
-            except ImportError:
-                # Fallback: try adding GroundingDINO to path if it exists but isn't installed
-                import sys
-                from pathlib import Path
-                possible_paths = [
-                    Path("/sc-cbint-vol/GroundingDINO"),
-                    Path(config_path).parent.parent.parent if config_path else None,
-                ]
-                for gd_path in possible_paths:
-                    if gd_path and gd_path.exists() and str(gd_path) not in sys.path:
-                        sys.path.insert(0, str(gd_path))
-                        break
-                
-                from GroundingDINO.groundingdino.models import build_model
-                from GroundingDINO.groundingdino.util.slconfig import SLConfig
-                from GroundingDINO.groundingdino.util.utils import clean_state_dict
-                self._groundingdino_module_prefix = "GroundingDINO.groundingdino"
+            from groundingdino.util.inference import load_model, load_image, predict
+            from groundingdino.util.slconfig import SLConfig
+            from groundingdino.util.utils import clean_state_dict
+            import groundingdino.datasets.transforms as T
             
-            args = SLConfig.fromfile(config_path)
+            self.gdino_load_model = load_model
+            self.gdino_load_image = load_image
+            self.gdino_predict = predict
+            self.gdino_SLConfig = SLConfig
+            self.gdino_clean_state_dict = clean_state_dict
+            self.gdino_transforms = T
+            
+            config_file = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+            weights_path = "groundingdino_swint_ogc.pth"
+            
+            if not Path(weights_path).exists():
+                print(f"Warning: GroundingDINO weights not found at {weights_path}")
+                print("Please download from: https://github.com/IDEA-Research/GroundingDINO/releases")
+                self.model = None
+                return
+            
+            args = self.gdino_SLConfig.fromfile(config_file)
             args.device = self.device
-            self.model = build_model(args)
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            self.model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
-            self.model.eval()
-            self.model.to(self.device)
-            self.tokenizer = self.model.tokenizer
-            print(f"Loaded GroundingDINO model on {self.device}")
-        except ImportError:
-            print("Warning: GroundingDINO not installed. Install with: pip install git+https://github.com/IDEA-Research/GroundingDINO.git")
+            model = self.gdino_load_model(args, weights_path)
+            model.eval()
+            self.model = model
+            self.transform = T.Compose([
+                T.RandomResize([800], max_size=1333),
+                T.ToTensor(),
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            ])
+            print(f"GroundingDINO loaded on {self.device}")
+        except ImportError as e:
+            print(f"Warning: GroundingDINO not available: {e}")
+            print("Install with: pip install groundingdino-py")
             self.model = None
         except Exception as e:
-            print(f"Error loading GroundingDINO model: {e}")
+            print(f"Warning: Failed to load GroundingDINO: {e}")
             self.model = None
     
-    def extract_noun_phrases(self, instruction: str) -> List[str]:
+    def parse_instruction(self, instruction: str) -> List[str]:
         """
-        Extract noun phrases from instruction that might be target objects.
+        Parse instruction to extract target objects.
         
-        Args:
-            instruction: Natural language instruction
-            
-        Returns:
-            List of potential target object phrases
+        Examples:
+            "pick up the red can" -> ["red can", "can"]
+            "move the cup to the table" -> ["cup"]
+            "grasp the bottle" -> ["bottle"]
         """
-        instruction_lower = instruction.lower()
+        if not instruction:
+            return []
+        
+        instruction = instruction.lower().strip()
         
         patterns = [
-            r"pick up (?:the )?([a-z]+(?: [a-z]+)*)",
-            r"grab (?:the )?([a-z]+(?: [a-z]+)*)",
-            r"move (?:the )?([a-z]+(?: [a-z]+)*)",
-            r"place (?:the )?([a-z]+(?: [a-z]+)*)",
-            r"put (?:the )?([a-z]+(?: [a-z]+)*)",
-            r"([a-z]+(?: [a-z]+)*) (?:on|onto|in|into)",
+            r"(?:pick up|grasp|grab|take|get|move|place|put)\s+(?:the\s+)?([a-z\s]+?)(?:\s+to|\s+on|\s+in|$)",
+            r"the\s+([a-z\s]+?)(?:\s+to|\s+on|\s+in|$)",
         ]
         
         objects = []
         for pattern in patterns:
-            matches = re.findall(pattern, instruction_lower)
-            objects.extend(matches)
+            matches = re.findall(pattern, instruction)
+            for match in matches:
+                obj = match.strip()
+                if obj and len(obj.split()) <= 3:
+                    objects.append(obj)
         
         if not objects:
-            words = instruction_lower.split()
-            if len(words) > 2:
+            words = instruction.split()
+            if len(words) >= 3:
                 objects.append(" ".join(words[-2:]))
-            elif len(words) > 0:
-                objects.append(words[-1])
         
-        return list(set(objects))
-    
-    def detect_objects(
-        self,
-        image: Image.Image,
-        prompt: str,
-    ) -> Tuple[List[Dict], Optional[torch.Tensor]]:
-        """
-        Detect objects in image using GroundingDINO.
-        
-        Args:
-            image: PIL Image
-            prompt: Text prompt describing objects to detect
-            
-        Returns:
-            Tuple of (detections list, image tensor)
-        """
-        if self.model is None:
-            return [], None
-        
-        try:
-            # Check if C++ extensions are available by trying to import the module
-            try:
-                import importlib
-                if self._groundingdino_module_prefix == "groundingdino":
-                    ms_deform_attn_module = importlib.import_module("groundingdino.models.GroundingDINO.ms_deform_attn")
-                else:
-                    ms_deform_attn_module = importlib.import_module("GroundingDINO.groundingdino.models.GroundingDINO.ms_deform_attn")
-                
-                # Check if MSDeformAttn class exists (it won't if C++ extensions failed)
-                if not hasattr(ms_deform_attn_module, 'MSDeformAttn'):
-                    # C++ extensions not compiled, return empty detections
-                    return [], None
-            except (ImportError, AttributeError):
-                # Can't check, but try anyway
-                pass
-            # Use torchvision transforms for preprocessing (more reliable than GroundingDINO-specific transforms)
-            from torchvision import transforms as T
-            import torch.nn.functional as F
-            
-            # GroundingDINO expects images resized to max 800px with max_size 1333
-            # Resize to 800px on shorter side, keeping aspect ratio
-            w, h = image.size
-            if h < w:
-                new_h, new_w = 800, int(800 * w / h)
-            else:
-                new_h, new_w = int(800 * h / w), 800
-            
-            # Ensure max dimension doesn't exceed 1333
-            if max(new_h, new_w) > 1333:
-                scale = 1333 / max(new_h, new_w)
-                new_h, new_w = int(new_h * scale), int(new_w * scale)
-            
-            transform = T.Compose([
-                T.Resize((new_h, new_w)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-            
-            image_tensor = transform(image).unsqueeze(0).to(self.device)
-            
-            with torch.no_grad():
-                try:
-                    outputs = self.model(image_tensor, captions=[prompt])
-                except (NameError, RuntimeError, AttributeError) as e:
-                    error_str = str(e)
-                    if "'_C'" in error_str or "_C" in error_str or "C++ ops" in error_str:
-                        # C++ extensions not available, return empty detections
-                        return [], None
-                    raise
-            
-            logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
-            boxes = outputs["pred_boxes"][0]  # (nq, 4)
-            
-            detections = []
-            for i in range(logits.shape[0]):
-                max_logit = logits[i].max().item()
-                if max_logit > self.box_threshold:
-                    box = boxes[i].cpu().numpy()
-                    detections.append({
-                        "box": box,
-                        "confidence": max_logit,
-                        "logits": logits[i].cpu().numpy(),
-                    })
-            
-            return detections, image_tensor
-        except Exception as e:
-            print(f"Error in object detection: {e}")
-            return [], None
-    
-    def compute_gripper_position(
-        self,
-        proprio: np.ndarray,
-        image_shape: Tuple[int, int],
-        camera_params: Optional[Dict] = None,
-    ) -> Optional[Tuple[float, float]]:
-        """
-        Estimate gripper position in image coordinates from proprioceptive state.
-        
-        Args:
-            proprio: Proprioceptive state vector
-            image_shape: (height, width) of image
-            camera_params: Optional camera calibration parameters
-            
-        Returns:
-            (x, y) pixel coordinates of gripper, or None if cannot estimate
-        """
-        if len(proprio) < 3:
-            return None
-        
-        eef_pos_3d = proprio[:3]
-        
-        if camera_params:
-            K = camera_params.get("intrinsic_matrix")
-            if K is not None:
-                eef_pos_homogeneous = np.array([eef_pos_3d[0], eef_pos_3d[1], eef_pos_3d[2], 1.0])
-                pixel_pos = K @ eef_pos_homogeneous[:3]
-                pixel_pos = pixel_pos / pixel_pos[2]
-                return (float(pixel_pos[0]), float(pixel_pos[1]))
-        
-        return None
+        return list(set(objects)) if objects else []
     
     def extract(
         self,
-        image: Image.Image,
+        image: np.ndarray,
         instruction: str,
-        proprio: Optional[np.ndarray] = None,
-        camera_params: Optional[Dict] = None,
+        gripper_bbox: Optional[Tuple[int, int, int, int]] = None,
     ) -> Dict[str, float]:
         """
         Extract geometric concepts from image and instruction.
         
         Args:
-            image: PIL Image
-            instruction: Natural language instruction
-            proprio: Optional proprioceptive state for gripper position
-            camera_params: Optional camera calibration parameters
-            
+            image: RGB image as numpy array (H, W, 3) uint8
+            instruction: Language instruction
+            gripper_bbox: Optional gripper bounding box (x1, y1, x2, y2) in pixels
+        
         Returns:
-            Dictionary of concept values
+            Dictionary of concept values:
+            - target_visible: 1.0 if target object detected with confidence > threshold
+            - aligned_with_target: 1.0 if gripper aligned with target (within threshold)
         """
         concepts = {
             "target_visible": 0.0,
@@ -350,35 +228,49 @@ class GeometricExtractor:
         if self.model is None:
             return concepts
         
-        noun_phrases = self.extract_noun_phrases(instruction)
-        if not noun_phrases:
-            return concepts
-        
-        prompt = " . ".join(noun_phrases) + " . gripper"
-        
-        detections, _ = self.detect_objects(image, prompt)
-        
-        if not detections:
-            return concepts
-        
-        target_detections = [d for d in detections if d["confidence"] > self.box_threshold]
-        if target_detections:
-            best_detection = max(target_detections, key=lambda x: x["confidence"])
-            concepts["target_visible"] = 1.0
+        try:
+            target_objects = self.parse_instruction(instruction)
+            if not target_objects:
+                return concepts
             
-            if proprio is not None:
-                box = best_detection["box"]
-                box_center_x = (box[0] + box[2]) / 2 * image.width
-                box_center_y = (box[1] + box[3]) / 2 * image.height
+            text_prompt = ". ".join(target_objects) + "."
+            
+            img_pil = Image.fromarray(image)
+            img_transformed, _ = self.transform(img_pil, None)
+            
+            with torch.no_grad():
+                boxes, logits, phrases = self.gdino_predict(
+                    model=self.model,
+                    image=img_transformed,
+                    caption=text_prompt,
+                    box_threshold=self.confidence_threshold,
+                    text_threshold=self.confidence_threshold,
+                )
+            
+            if len(boxes) > 0:
+                max_conf_idx = logits.argmax().item()
+                target_box = boxes[max_conf_idx].cpu().numpy()
+                target_confidence = logits[max_conf_idx].item()
                 
-                gripper_pos = self.compute_gripper_position(proprio, image.size, camera_params)
-                if gripper_pos:
-                    distance = np.sqrt(
-                        (gripper_pos[0] - box_center_x) ** 2 +
-                        (gripper_pos[1] - box_center_y) ** 2
-                    )
-                    if distance < self.alignment_pixel_threshold:
-                        concepts["aligned_with_target"] = 1.0
+                if target_confidence >= self.confidence_threshold:
+                    concepts["target_visible"] = 1.0
+                    
+                    if gripper_bbox is not None:
+                        target_center = np.array([
+                            (target_box[0] + target_box[2]) / 2,
+                            (target_box[1] + target_box[3]) / 2,
+                        ])
+                        gripper_center = np.array([
+                            (gripper_bbox[0] + gripper_bbox[2]) / 2,
+                            (gripper_bbox[1] + gripper_bbox[3]) / 2,
+                        ])
+                        
+                        distance = np.linalg.norm(target_center - gripper_center)
+                        if distance <= self.alignment_pixel_threshold:
+                            concepts["aligned_with_target"] = 1.0
+        
+        except Exception as e:
+            print(f"Error in geometric extraction: {e}")
         
         return concepts
 
