@@ -573,6 +573,19 @@ def mine_concepts_pass_b(
     print(f"Skipped - no image: {skipped_no_img}", flush=True)
     print(f"Skipped - empty instruction: {skipped_empty_instruction}", flush=True)
     
+    # Check concept statistics
+    if len(all_concept_records) > 0:
+        concept_sums = {}
+        for record in all_concept_records[:100]:  # Sample first 100
+            for concept_name, value in record["concepts"].items():
+                if concept_name not in concept_sums:
+                    concept_sums[concept_name] = 0.0
+                concept_sums[concept_name] += value
+        print(f"\nConcept statistics (first 100 records):", flush=True)
+        for concept_name, total in concept_sums.items():
+            avg = total / min(100, len(all_concept_records))
+            print(f"  {concept_name}: avg={avg:.3f}, total={total:.1f}", flush=True)
+    
     if len(all_concept_records) == 0:
         print("No concept records extracted. Exiting.")
         return
