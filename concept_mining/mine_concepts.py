@@ -485,17 +485,20 @@ def mine_concepts_pass_b(
         
         frames_with_concepts = 0
         for frame_idx in range(num_frames):
-            img = extract_image_from_trajectory(traj, frame_idx)
+            debug_img = (traj_idx < 3 and frame_idx == 0)
+            img = extract_image_from_trajectory(traj, frame_idx, debug=debug_img)
             if img is None:
                 skipped_no_img += 1
-                if traj_idx < 3 and frame_idx == 0:
-                    print(f"DEBUG: No image extracted from trajectory {traj_idx}, frame {frame_idx}")
-                    print(f"  Observation keys: {list(obs.keys())}")
+                if debug_img:
+                    print(f"DEBUG: No image extracted from trajectory {traj_idx}, frame {frame_idx}", flush=True)
+                    print(f"  Observation keys: {list(obs.keys())}", flush=True)
                     if "image_primary" in obs:
                         img_data = obs["image_primary"]
                         if isinstance(img_data, tf.Tensor):
                             img_data = img_data.numpy()
-                        print(f"  image_primary shape: {img_data.shape if hasattr(img_data, 'shape') else type(img_data)}")
+                        print(f"  image_primary shape: {img_data.shape if hasattr(img_data, 'shape') else type(img_data)}", flush=True)
+                        print(f"  image_primary dtype: {img_data.dtype if hasattr(img_data, 'dtype') else 'N/A'}", flush=True)
+                        print(f"  num_frames: {num_frames}, frame_idx: {frame_idx}", flush=True)
                 continue
             
             proprio_frame = None
@@ -585,26 +588,35 @@ def mine_concepts_pass_b(
         print(f"Sample record: {concept_dataset[0]}")
 
 
-def extract_image_from_trajectory(traj, frame_idx):
+def extract_image_from_trajectory(traj, frame_idx, debug=False):
     """Extract image from trajectory at specific frame index."""
     if "observation" not in traj:
+        if debug:
+            print(f"  DEBUG extract_image: No 'observation' key in trajectory", flush=True)
         return None
     
     obs = traj["observation"]
     
     img = None
+    img_key = None
     if "image_primary" in obs:
         img = obs["image_primary"]
+        img_key = "image_primary"
     elif "image" in obs:
         images = obs["image"]
         if isinstance(images, dict):
             img = images.get("primary") or list(images.values())[0]
+            img_key = "image[dict]"
         else:
             img = images
+            img_key = "image"
     elif "rgb" in obs:
         img = obs["rgb"]
+        img_key = "rgb"
     
     if img is None:
+        if debug:
+            print(f"  DEBUG extract_image: No image found. Available keys: {list(obs.keys())}", flush=True)
         return None
     
     if isinstance(img, tf.Tensor):
@@ -612,11 +624,20 @@ def extract_image_from_trajectory(traj, frame_idx):
     else:
         img_np = np.array(img)
     
+    if debug:
+        print(f"  DEBUG extract_image: Found {img_key}, shape: {img_np.shape}, dtype: {img_np.dtype}", flush=True)
+    
     if len(img_np.shape) == 4:
+        if frame_idx >= img_np.shape[0]:
+            if debug:
+                print(f"  DEBUG extract_image: frame_idx {frame_idx} >= shape[0] {img_np.shape[0]}", flush=True)
+            return None
         img_np = img_np[frame_idx]
     elif len(img_np.shape) == 3:
         img_np = img_np
     else:
+        if debug:
+            print(f"  DEBUG extract_image: Unexpected shape {img_np.shape}, expected 3D or 4D", flush=True)
         return None
     
     if img_np.dtype != np.uint8:
@@ -625,7 +646,12 @@ def extract_image_from_trajectory(traj, frame_idx):
         else:
             img_np = img_np.astype(np.uint8)
     
-    return Image.fromarray(img_np)
+    try:
+        return Image.fromarray(img_np)
+    except Exception as e:
+        if debug:
+            print(f"  DEBUG extract_image: Error creating PIL Image: {e}", flush=True)
+        return None
 
 
 def main():
