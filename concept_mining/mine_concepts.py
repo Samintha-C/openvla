@@ -625,20 +625,47 @@ def extract_image_from_trajectory(traj, frame_idx, debug=False):
         img_np = np.array(img)
     
     if debug:
-        print(f"  DEBUG extract_image: Found {img_key}, shape: {img_np.shape}, dtype: {img_np.dtype}", flush=True)
+        print(f"  DEBUG extract_image: Found {img_key}, shape: {img_np.shape if hasattr(img_np, 'shape') else 'N/A'}, dtype: {type(img_np)}", flush=True)
     
-    if len(img_np.shape) == 4:
-        if frame_idx >= img_np.shape[0]:
-            if debug:
-                print(f"  DEBUG extract_image: frame_idx {frame_idx} >= shape[0] {img_np.shape[0]}", flush=True)
-            return None
-        img_np = img_np[frame_idx]
-    elif len(img_np.shape) == 3:
-        img_np = img_np
-    else:
+    if img_np.dtype == object or (isinstance(img_np, np.ndarray) and img_np.dtype.type is np.str_):
         if debug:
-            print(f"  DEBUG extract_image: Unexpected shape {img_np.shape}, expected 3D or 4D", flush=True)
-        return None
+            print(f"  DEBUG extract_image: Image is encoded string, decoding...", flush=True)
+        if isinstance(img, tf.Tensor):
+            img_bytes = img.numpy()
+        else:
+            img_bytes = img_np
+        
+        if len(img_bytes.shape) > 0:
+            if frame_idx >= len(img_bytes):
+                if debug:
+                    print(f"  DEBUG extract_image: frame_idx {frame_idx} >= len {len(img_bytes)}", flush=True)
+                return None
+            img_bytes = img_bytes[frame_idx]
+        
+        if len(img_bytes) == 0:
+            if debug:
+                print(f"  DEBUG extract_image: Empty encoded image", flush=True)
+            return None
+        
+        try:
+            img_np = tf.io.decode_image(img_bytes, expand_animations=False, dtype=tf.uint8).numpy()
+        except Exception as e:
+            if debug:
+                print(f"  DEBUG extract_image: Error decoding image: {e}", flush=True)
+            return None
+    else:
+        if len(img_np.shape) == 4:
+            if frame_idx >= img_np.shape[0]:
+                if debug:
+                    print(f"  DEBUG extract_image: frame_idx {frame_idx} >= shape[0] {img_np.shape[0]}", flush=True)
+                return None
+            img_np = img_np[frame_idx]
+        elif len(img_np.shape) == 3:
+            img_np = img_np
+        else:
+            if debug:
+                print(f"  DEBUG extract_image: Unexpected shape {img_np.shape}, expected 3D or 4D", flush=True)
+            return None
     
     if img_np.dtype != np.uint8:
         if img_np.max() <= 1.0:
