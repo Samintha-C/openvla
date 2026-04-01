@@ -489,10 +489,11 @@ def mine_concepts_pass_b(
     confidence_threshold: float = 0.3,
     alignment_pixel_threshold: int = 50,
     pass_a_concepts_path: Optional[Path] = None,
+    detection_stride: int = 1,
 ):
     """
     Mine Pass B (geometric) concepts from RLDS dataset using GroundingDINO.
-    
+
     Args:
         dataset_name: Name of the RLDS dataset
         data_dir: Directory containing RLDS data
@@ -501,6 +502,7 @@ def mine_concepts_pass_b(
         confidence_threshold: GroundingDINO confidence threshold
         alignment_pixel_threshold: Pixel distance threshold for alignment
         pass_a_concepts_path: Optional path to Pass A concepts to merge
+        detection_stride: Run GroundingDINO every N frames, carry forward for skipped frames
     """
     print(f"Mining Pass B (geometric) concepts from {dataset_name} (split={'train' if train else 'val'})...")
     
@@ -519,7 +521,9 @@ def mine_concepts_pass_b(
     geometric_extractor = GeometricExtractor(
         confidence_threshold=confidence_threshold,
         alignment_pixel_threshold=alignment_pixel_threshold,
+        detection_stride=detection_stride,
     )
+    print(f"Detection stride: {detection_stride} (inference every {detection_stride} frames)")
     
     if geometric_extractor.model is None:
         print("Error: GroundingDINO model not available. Cannot proceed with Pass B.")
@@ -661,6 +665,7 @@ def main():
     parser.add_argument("--confidence_threshold", type=float, default=0.3, help="GroundingDINO confidence threshold (Pass B)")
     parser.add_argument("--alignment_pixel_threshold", type=int, default=50, help="Alignment pixel threshold (Pass B)")
     parser.add_argument("--pass_a_concepts_path", type=str, default=None, help="Path to Pass A concepts to merge (Pass B)")
+    parser.add_argument("--detection_stride", type=int, default=1, help="Run GroundingDINO every N frames (Pass B, default: 1)")
     
     args = parser.parse_args()
     
@@ -689,6 +694,7 @@ def main():
             confidence_threshold=args.confidence_threshold,
             alignment_pixel_threshold=args.alignment_pixel_threshold,
             pass_a_concepts_path=pass_a_path,
+            detection_stride=args.detection_stride,
         )
 
 
