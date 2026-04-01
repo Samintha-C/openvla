@@ -337,15 +337,43 @@ def mine_concepts_pass_a(
         print(f"Sample record: {concept_dataset[0]}")
 
 
+def _log_traj_structure(traj: Dict[str, Any], traj_idx: int) -> None:
+    """Log the structure of the first trajectory for debugging."""
+    print(f"\n{'='*60}")
+    print(f"[DEBUG] Trajectory {traj_idx} structure dump:")
+    print(f"  Top-level keys: {list(traj.keys())}")
+    if "observation" in traj:
+        obs = traj["observation"]
+        print(f"  observation keys: {list(obs.keys())}")
+        for k, v in obs.items():
+            if hasattr(v, 'shape'):
+                print(f"    obs[{k!r}]: shape={v.shape}, dtype={v.dtype}")
+            elif hasattr(v, '__len__'):
+                print(f"    obs[{k!r}]: type={type(v).__name__}, len={len(v)}")
+            else:
+                print(f"    obs[{k!r}]: type={type(v).__name__}, value={repr(v)[:100]}")
+    if "task" in traj:
+        task = traj["task"]
+        print(f"  task keys: {list(task.keys())}")
+        for k, v in task.items():
+            print(f"    task[{k!r}]: type={type(v).__name__}, value={repr(v)[:120]}")
+    if "action" in traj:
+        a = traj["action"]
+        if hasattr(a, 'shape'):
+            print(f"  action: shape={a.shape}, dtype={a.dtype}")
+    print(f"{'='*60}\n")
+
+
 def extract_concepts_from_trajectory_pass_b(
     traj: Dict[str, Any],
     dataset_name: str,
     episode_idx: int,
     geometric_extractor: GeometricExtractor,
+    verbose: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Extract Pass B (geometric) concepts from a trajectory.
-    
+
     Returns:
         List of concept dictionaries, one per frame
     """
@@ -353,6 +381,8 @@ def extract_concepts_from_trajectory_pass_b(
     geometric_extractor.reset()
 
     if "observation" not in traj:
+        if verbose:
+            print(f"  [traj {episode_idx}] SKIP: no 'observation' key")
         return concept_records
 
     obs = traj["observation"]
@@ -366,10 +396,12 @@ def extract_concepts_from_trajectory_pass_b(
             images = images_dict
     elif "image_primary" in obs:
         images = obs["image_primary"]
-    
+
     if images is None:
+        if verbose:
+            print(f"  [traj {episode_idx}] SKIP: no images found. obs keys: {list(obs.keys())}")
         return concept_records
-    
+
     instruction = None
     if "task" in traj and "language_instruction" in traj["task"]:
         instruction = traj["task"]["language_instruction"]
@@ -381,25 +413,53 @@ def extract_concepts_from_trajectory_pass_b(
             else:
                 instruction = str(instruction)
         instruction = str(instruction).strip()
-    
+
     if not instruction:
+        if verbose:
+            traj_keys = list(traj.keys())
+            task_keys = list(traj.get("task", {}).keys()) if isinstance(traj.get("task"), dict) else "N/A"
+            print(f"  [traj {episode_idx}] SKIP: no instruction. traj keys: {traj_keys}, task keys: {task_keys}")
         return concept_records
-    
+
     if isinstance(images, tf.Tensor):
         images_np = images.numpy()
     else:
         images_np = np.array(images)
-    
+
+    if verbose:
+        print(f"  [traj {episode_idx}] Raw images: shape={images_np.shape}, dtype={images_np.dtype}")
+
+    # RLDS stores images as encoded byte strings (JPEG/PNG). Decode them.
+    if images_np.dtype.kind in ("S", "U", "O"):
+        from PIL import Image as PILImage
+        import io
+        if verbose:
+            sample = images_np.flat[0] if images_np.size > 0 else None
+            print(f"  [traj {episode_idx}] Decoding byte-string images. sample type={type(sample).__name__}, len={len(sample) if sample else 0}")
+        decoded = []
+        for raw in images_np:
+            if isinstance(raw, (bytes, np.bytes_)):
+                decoded.append(np.array(PILImage.open(io.BytesIO(raw)).convert("RGB")))
+        if not decoded:
+            if verbose:
+                print(f"  [traj {episode_idx}] SKIP: no decodable images")
+            return concept_records
+        images_np = np.stack(decoded)
+        if verbose:
+            print(f"  [traj {episode_idx}] Decoded images: shape={images_np.shape}, dtype={images_np.dtype}")
+
     if len(images_np.shape) == 4:
         traj_len = images_np.shape[0]
     elif len(images_np.shape) == 3:
         traj_len = 1
         images_np = images_np[None]
     else:
+        if verbose:
+            print(f"  [traj {episode_idx}] SKIP: unexpected image shape {images_np.shape}")
         return concept_records
-    
+
     episode_id = f"{dataset_name}_episode_{episode_idx:06d}"
-    
+
     for frame_idx in range(traj_len):
         img = images_np[frame_idx]
         if img.dtype != np.uint8:
@@ -407,9 +467,9 @@ def extract_concepts_from_trajectory_pass_b(
                 img = (img * 255).astype(np.uint8)
             else:
                 img = img.astype(np.uint8)
-        
+
         geometric_concepts = geometric_extractor.extract(img, instruction)
-        
+
         concept_record = {
             "dataset_name": dataset_name,
             "episode_id": episode_id,
@@ -417,7 +477,7 @@ def extract_concepts_from_trajectory_pass_b(
             "concepts": geometric_concepts,
         }
         concept_records.append(concept_record)
-    
+
     return concept_records
 
 
@@ -490,28 +550,71 @@ def mine_concepts_pass_b(
         return
     
     all_concept_records = []
-    
+
     print(f"Iterating through trajectories...")
     skip_count = 0
+    skip_reasons = {"no_observation": 0, "no_records": 0, "exception": 0}
+    target_visible_count = 0
+    first_traj_logged = False
+    import time
+    t_start = time.time()
+
     for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
+        # Log structure of the very first trajectory for debugging
+        if not first_traj_logged:
+            _log_traj_structure(traj, traj_idx)
+            first_traj_logged = True
+
         if "observation" not in traj:
+            skip_reasons["no_observation"] += 1
             continue
+
+        # Verbose for first 3 trajectories to diagnose data flow
+        verbose = traj_idx < 3
 
         try:
             concept_records = extract_concepts_from_trajectory_pass_b(
-                traj, dataset_name, traj_idx, geometric_extractor
+                traj, dataset_name, traj_idx, geometric_extractor, verbose=verbose
             )
         except Exception as e:
             print(f"Error extracting concepts from trajectory {traj_idx}, skipping: {e}")
+            import traceback
+            traceback.print_exc()
+            skip_reasons["exception"] += 1
             skip_count += 1
             continue
+
+        if not concept_records:
+            skip_reasons["no_records"] += 1
+
+        # Track concept stats for monitoring
+        for rec in concept_records:
+            if rec["concepts"].get("target_visible", 0.0) > 0.5:
+                target_visible_count += 1
 
         all_concept_records.extend(concept_records)
 
         if (traj_idx + 1) % 100 == 0:
-            print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records (skipped: {skip_count})")
-    
-    print(f"Total concept records: {len(all_concept_records)}")
+            elapsed = time.time() - t_start
+            rate = (traj_idx + 1) / elapsed
+            frames = len(all_concept_records)
+            tv_pct = 100.0 * target_visible_count / frames if frames > 0 else 0
+            print(
+                f"[{traj_idx+1} trajs | {elapsed:.0f}s | {rate:.1f} traj/s] "
+                f"frames={frames}, skipped={skip_count}, "
+                f"target_visible={tv_pct:.1f}%"
+            )
+
+    elapsed_total = time.time() - t_start
+    print(f"\n{'='*60}")
+    print(f"Pass B mining complete in {elapsed_total:.0f}s")
+    print(f"  Total trajectories processed: {traj_idx + 1}")
+    print(f"  Total concept records: {len(all_concept_records)}")
+    print(f"  Skipped: {skip_count} (reasons: {skip_reasons})")
+    if len(all_concept_records) > 0:
+        tv_pct = 100.0 * target_visible_count / len(all_concept_records)
+        print(f"  Target visible in {target_visible_count}/{len(all_concept_records)} frames ({tv_pct:.1f}%)")
+    print(f"{'='*60}")
     
     if len(all_concept_records) == 0:
         print("No concept records extracted. Exiting.")
