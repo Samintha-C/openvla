@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 import tensorflow as tf
 import dlimp as dl
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 from tqdm import tqdm
 
 import sys
@@ -350,12 +350,13 @@ def extract_concepts_from_trajectory_pass_b(
         List of concept dictionaries, one per frame
     """
     concept_records = []
-    
+    geometric_extractor.reset()
+
     if "observation" not in traj:
         return concept_records
-    
+
     obs = traj["observation"]
-    
+
     images = None
     if "image" in obs:
         images_dict = obs["image"]
@@ -491,17 +492,24 @@ def mine_concepts_pass_b(
     all_concept_records = []
     
     print(f"Iterating through trajectories...")
+    skip_count = 0
     for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
         if "observation" not in traj:
             continue
-        
-        concept_records = extract_concepts_from_trajectory_pass_b(
-            traj, dataset_name, traj_idx, geometric_extractor
-        )
+
+        try:
+            concept_records = extract_concepts_from_trajectory_pass_b(
+                traj, dataset_name, traj_idx, geometric_extractor
+            )
+        except Exception as e:
+            print(f"Error extracting concepts from trajectory {traj_idx}, skipping: {e}")
+            skip_count += 1
+            continue
+
         all_concept_records.extend(concept_records)
-        
+
         if (traj_idx + 1) % 100 == 0:
-            print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records")
+            print(f"Processed {traj_idx + 1} trajectories, {len(all_concept_records)} concept records (skipped: {skip_count})")
     
     print(f"Total concept records: {len(all_concept_records)}")
     
