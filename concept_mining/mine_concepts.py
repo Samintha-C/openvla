@@ -555,26 +555,30 @@ def mine_concepts_pass_b(
     
     all_concept_records = []
 
-    print(f"Iterating through trajectories...")
+    import sys
+    import time
+
+    print(f"Iterating through trajectories...", flush=True)
     skip_count = 0
     skip_reasons = {"no_observation": 0, "no_records": 0, "exception": 0}
     target_visible_count = 0
     first_traj_logged = False
-    import time
     t_start = time.time()
 
-    for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator())):
+    for traj_idx, traj in enumerate(tqdm(ds.as_numpy_iterator(), file=sys.stderr)):
         # Log structure of the very first trajectory for debugging
         if not first_traj_logged:
             _log_traj_structure(traj, traj_idx)
+            sys.stdout.flush()
             first_traj_logged = True
+            t_first = time.time()
 
         if "observation" not in traj:
             skip_reasons["no_observation"] += 1
             continue
 
         # Verbose for first 3 trajectories to diagnose data flow
-        verbose = traj_idx < 3
+        verbose = True
 
         try:
             concept_records = extract_concepts_from_trajectory_pass_b(
@@ -587,6 +591,12 @@ def mine_concepts_pass_b(
             skip_reasons["exception"] += 1
             skip_count += 1
             continue
+
+        if traj_idx == 0:
+            t_first_done = time.time()
+            print(f"\n[TIMING] First trajectory: {t_first_done - t_first:.1f}s, {len(concept_records)} records", flush=True)
+            if concept_records:
+                print(f"[SAMPLE] {concept_records[0]['concepts']}", flush=True)
 
         if not concept_records:
             skip_reasons["no_records"] += 1
@@ -606,7 +616,8 @@ def mine_concepts_pass_b(
             print(
                 f"[{traj_idx+1} trajs | {elapsed:.0f}s | {rate:.1f} traj/s] "
                 f"frames={frames}, skipped={skip_count}, "
-                f"target_visible={tv_pct:.1f}%"
+                f"target_visible={tv_pct:.1f}%",
+                flush=True,
             )
 
     elapsed_total = time.time() - t_start
