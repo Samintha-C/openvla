@@ -7,6 +7,7 @@ import tensorflow as tf
 import dlimp as dl
 from datasets import Dataset, load_from_disk
 from tqdm import tqdm
+from PIL import Image as PILImage
 
 import sys
 from pathlib import Path
@@ -370,6 +371,7 @@ def extract_concepts_from_trajectory_pass_b(
     episode_idx: int,
     geometric_extractor: GeometricExtractor,
     verbose: bool = False,
+    images_save_dir: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """
     Extract Pass B (geometric) concepts from a trajectory.
@@ -478,6 +480,10 @@ def extract_concepts_from_trajectory_pass_b(
         }
         concept_records.append(concept_record)
 
+        if images_save_dir is not None:
+            img_filename = f"{episode_id}_frame_{frame_idx:05d}.jpg"
+            PILImage.fromarray(img).save(images_save_dir / img_filename, quality=85)
+
     return concept_records
 
 
@@ -490,6 +496,8 @@ def mine_concepts_pass_b(
     alignment_pixel_threshold: int = 50,
     pass_a_concepts_path: Optional[Path] = None,
     detection_stride: int = 1,
+    max_trajectories: Optional[int] = None,
+    save_images: bool = False,
 ):
     """
     Mine Pass B (geometric) concepts from RLDS dataset using GroundingDINO.
@@ -524,7 +532,15 @@ def mine_concepts_pass_b(
         detection_stride=detection_stride,
     )
     print(f"Detection stride: {detection_stride} (inference every {detection_stride} frames)")
-    
+    if max_trajectories is not None:
+        print(f"Max trajectories: {max_trajectories}")
+
+    images_save_dir = None
+    if save_images:
+        images_save_dir = output_path / "images"
+        images_save_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saving images to {images_save_dir}")
+
     if geometric_extractor.model is None:
         print("Error: GroundingDINO model not available. Cannot proceed with Pass B.")
         return
@@ -582,7 +598,8 @@ def mine_concepts_pass_b(
 
         try:
             concept_records = extract_concepts_from_trajectory_pass_b(
-                traj, dataset_name, traj_idx, geometric_extractor, verbose=verbose
+                traj, dataset_name, traj_idx, geometric_extractor,
+                verbose=verbose, images_save_dir=images_save_dir,
             )
         except Exception as e:
             print(f"Error extracting concepts from trajectory {traj_idx}, skipping: {e}")
@@ -607,6 +624,10 @@ def mine_concepts_pass_b(
                 target_visible_count += 1
 
         all_concept_records.extend(concept_records)
+
+        if max_trajectories is not None and traj_idx + 1 >= max_trajectories:
+            print(f"\n[LIMIT] Reached max_trajectories={max_trajectories}, stopping early.", flush=True)
+            break
 
         if (traj_idx + 1) % 100 == 0:
             elapsed = time.time() - t_start
@@ -677,6 +698,8 @@ def main():
     parser.add_argument("--alignment_pixel_threshold", type=int, default=50, help="Alignment pixel threshold (Pass B)")
     parser.add_argument("--pass_a_concepts_path", type=str, default=None, help="Path to Pass A concepts to merge (Pass B)")
     parser.add_argument("--detection_stride", type=int, default=1, help="Run GroundingDINO every N frames (Pass B, default: 1)")
+    parser.add_argument("--max_trajectories", type=int, default=None, help="Stop after N trajectories (Pass B, default: None = all)")
+    parser.add_argument("--save_images", action="store_true", help="Save each frame as JPEG alongside the concept dataset (Pass B)")
     
     args = parser.parse_args()
     
@@ -706,6 +729,8 @@ def main():
             alignment_pixel_threshold=args.alignment_pixel_threshold,
             pass_a_concepts_path=pass_a_path,
             detection_stride=args.detection_stride,
+            max_trajectories=args.max_trajectories,
+            save_images=args.save_images,
         )
 
 
