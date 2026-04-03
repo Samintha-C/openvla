@@ -149,6 +149,7 @@ class GeometricExtractor:
         self.model = None
         self._load_model()
         self.reset()
+        self.reset_stats()
 
     def reset(self) -> None:
         """Clear all per-trajectory temporal state. Call between trajectories."""
@@ -157,6 +158,26 @@ class GeometricExtractor:
         self._cached_gripper_box: Optional[np.ndarray] = None
         self._frame_counter: int = 0
         self._last_detection_result: Optional[Dict[str, float]] = None
+
+    def reset_stats(self) -> None:
+        """Reset cumulative diagnostic counters. Call once before a mining run."""
+        self._gripper_detected: int = 0   # GroundingDINO found the gripper
+        self._gripper_fallback: int = 0   # fell back to fixed prior
+        self._target_conf_sum: float = 0.0
+        self._target_conf_count: int = 0
+
+    def get_stats(self) -> dict:
+        """Return cumulative diagnostic stats across all processed frames."""
+        total_gripper = self._gripper_detected + self._gripper_fallback
+        fallback_pct = 100.0 * self._gripper_fallback / total_gripper if total_gripper > 0 else 0.0
+        mean_conf = self._target_conf_sum / self._target_conf_count if self._target_conf_count > 0 else 0.0
+        return {
+            "gripper_detected": self._gripper_detected,
+            "gripper_fallback": self._gripper_fallback,
+            "gripper_fallback_pct": fallback_pct,
+            "target_detections": self._target_conf_count,
+            "target_mean_conf": mean_conf,
+        }
 
     # ------------------------------------------------------------------
     # Model loading
@@ -281,7 +302,9 @@ class GeometricExtractor:
         if len(boxes) > 0:
             best = boxes[confs.argmax()]
             self._cached_gripper_box = best
+            self._gripper_detected += 1
             return best
+        self._gripper_fallback += 1
         return None
 
     # ------------------------------------------------------------------
@@ -333,6 +356,8 @@ class GeometricExtractor:
             box = all_boxes[idx]
             if gripper_box is not None and self._compute_iou(box, gripper_box) > 0.3:
                 continue
+            self._target_conf_sum += all_confs[idx]
+            self._target_conf_count += 1
             return box
         return None
 

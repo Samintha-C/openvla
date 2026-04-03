@@ -476,6 +476,7 @@ def extract_concepts_from_trajectory_pass_b(
             "dataset_name": dataset_name,
             "episode_id": episode_id,
             "frame_index": int(frame_idx),
+            "instruction": instruction,
             "concepts": geometric_concepts,
         }
         concept_records.append(concept_record)
@@ -570,6 +571,7 @@ def mine_concepts_pass_b(
         return
     
     all_concept_records = []
+    geometric_extractor.reset_stats()
 
     import sys
     import time
@@ -577,7 +579,9 @@ def mine_concepts_pass_b(
     print(f"Iterating through trajectories...", flush=True)
     skip_count = 0
     skip_reasons = {"no_observation": 0, "no_records": 0, "exception": 0}
-    target_visible_count = 0
+    concept_sums: dict = {}
+    concept_counts: dict = {}
+    instruction_sample: list = []
     first_traj_logged = False
     t_start = time.time()
 
@@ -618,10 +622,24 @@ def mine_concepts_pass_b(
         if not concept_records:
             skip_reasons["no_records"] += 1
 
-        # Track concept stats for monitoring
+        # Collect instruction sample from first 10 trajectories
+        if len(instruction_sample) < 10 and concept_records:
+            instr = concept_records[0].get("instruction", "")
+            if instr and instr not in instruction_sample:
+                instruction_sample.append(instr)
+                if len(instruction_sample) == 1:
+                    print(f"\n[INSTRUCTIONS sample (first 10 unique)]", flush=True)
+                print(f"  {len(instruction_sample):2d}. {instr}", flush=True)
+
+        # Track per-concept stats
+        concept_nonzero: dict = concept_sums.get("__nonzero__", {})
         for rec in concept_records:
-            if rec["concepts"].get("target_visible", 0.0) > 0.5:
-                target_visible_count += 1
+            for k, v in rec["concepts"].items():
+                concept_sums[k] = concept_sums.get(k, 0.0) + v
+                concept_counts[k] = concept_counts.get(k, 0) + 1
+                if v > 1e-6:
+                    concept_nonzero[k] = concept_nonzero.get(k, 0) + 1
+        concept_sums["__nonzero__"] = concept_nonzero
 
         all_concept_records.extend(concept_records)
 
@@ -633,13 +651,17 @@ def mine_concepts_pass_b(
             elapsed = time.time() - t_start
             rate = (traj_idx + 1) / elapsed
             frames = len(all_concept_records)
-            tv_pct = 100.0 * target_visible_count / frames if frames > 0 else 0
-            print(
-                f"[{traj_idx+1} trajs | {elapsed:.0f}s | {rate:.1f} traj/s] "
-                f"frames={frames}, skipped={skip_count}, "
-                f"target_visible={tv_pct:.1f}%",
-                flush=True,
-            )
+            gstats = geometric_extractor.get_stats()
+            print(f"\n[{traj_idx+1} trajs | {elapsed:.0f}s | {rate:.1f} traj/s | frames={frames} | skipped={skip_count}]", flush=True)
+            print(f"  Gripper: detected={gstats['gripper_detected']}  fallback_to_prior={gstats['gripper_fallback']} ({gstats['gripper_fallback_pct']:.1f}%)", flush=True)
+            print(f"  Target:  detections={gstats['target_detections']}  mean_conf={gstats['target_mean_conf']:.3f}", flush=True)
+            concept_nonzero = concept_sums.get("__nonzero__", {})
+            print(f"  Concept rates (positive or nonzero):", flush=True)
+            for k in concept_counts:
+                n = concept_counts[k]
+                mean_val = concept_sums[k] / n if n > 0 else 0.0
+                pos_rate = concept_nonzero.get(k, 0) / n if n > 0 else 0.0
+                print(f"    {k:<28} mean={mean_val:+.4f}  nonzero={pos_rate:.1%}", flush=True)
 
     elapsed_total = time.time() - t_start
     print(f"\n{'='*60}")
