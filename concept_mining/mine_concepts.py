@@ -670,6 +670,7 @@ def mine_concepts_pass_b(
     print(f"  Total concept records: {len(all_concept_records)}")
     print(f"  Skipped: {skip_count} (reasons: {skip_reasons})")
     if len(all_concept_records) > 0:
+        target_visible_count = concept_sums.get("__nonzero__", {}).get("target_visible", 0)
         tv_pct = 100.0 * target_visible_count / len(all_concept_records)
         print(f"  Target visible in {target_visible_count}/{len(all_concept_records)} frames ({tv_pct:.1f}%)")
     print(f"{'='*60}")
