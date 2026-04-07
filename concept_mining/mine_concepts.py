@@ -562,6 +562,7 @@ def mine_concepts_pass_b(
     workspace_z_min: float = 0.0,
     workspace_z_max: float = 0.3,
     gripper_closed_threshold: float = 0.05,
+    max_target_bbox_area: float = 0.25,
 ):
     """
     Mine Pass B (geometric) concepts from RLDS dataset using GroundingDINO.
@@ -600,6 +601,7 @@ def mine_concepts_pass_b(
         workspace_y_max=workspace_y_max,
         workspace_z_min=workspace_z_min,
         workspace_z_max=workspace_z_max,
+        max_target_bbox_area=max_target_bbox_area,
     )
     print(f"Target detection: once per trajectory + on gripper-state changes")
     print(f"Depth estimation: {'enabled' if use_depth else 'disabled'}")
@@ -800,6 +802,8 @@ def main():
     parser.add_argument("--workspace_y_max", type=float, default=0.25, help="Workspace Y upper bound (Pass B)")
     parser.add_argument("--workspace_z_min", type=float, default=0.0, help="Workspace Z lower bound (Pass B)")
     parser.add_argument("--workspace_z_max", type=float, default=0.3, help="Workspace Z upper bound (Pass B)")
+    parser.add_argument("--max_target_bbox_area", type=float, default=0.25,
+                        help="Max normalized bbox area (w*h) for target detection; larger detections are rejected as table/destination (Pass B)")
     
     args = parser.parse_args()
     
@@ -838,6 +842,7 @@ def main():
             workspace_z_min=args.workspace_z_min,
             workspace_z_max=args.workspace_z_max,
             gripper_closed_threshold=args.gripper_closed_threshold,
+            max_target_bbox_area=args.max_target_bbox_area,
         )
 
 

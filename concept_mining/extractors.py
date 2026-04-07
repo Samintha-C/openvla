@@ -136,6 +136,7 @@ class GeometricExtractor:
         workspace_y_max: float = 0.25,
         workspace_z_min: float = 0.0,
         workspace_z_max: float = 0.3,
+        max_target_bbox_area: float = 0.25,
     ):
         """
         Args:
@@ -146,6 +147,9 @@ class GeometricExtractor:
             workspace_{x,y,z}_{min,max}: Empirical EEF workspace bounds used to
                 normalize proprio XYZ into [0, 1]. Defaults tuned for
                 BridgeDataV2 WidowX.
+            max_target_bbox_area: Reject detections with normalized w*h above
+                this threshold. Manipulated objects in BridgeDataV2 are small;
+                large detections are almost always the table or destination.
         """
         self.confidence_threshold = confidence_threshold
         if device is None:
@@ -162,6 +166,7 @@ class GeometricExtractor:
         self.workspace_y_max = workspace_y_max
         self.workspace_z_min = workspace_z_min
         self.workspace_z_max = workspace_z_max
+        self.max_target_bbox_area = max_target_bbox_area
 
         self.model = None
         self.depth_estimator = None
@@ -304,6 +309,82 @@ class GeometricExtractor:
         return boxes.cpu().numpy(), logits.cpu().numpy(), phrases
 
     # ------------------------------------------------------------------
+    # Instruction parsing — extract the manipulated object noun phrase
+    # ------------------------------------------------------------------
+
+    # Verbs that precede the target object in BridgeDataV2 instructions.
+    # Sorted longest-first at use time so "pick up" matches before "pick".
+    _MANIPULATE_VERBS: List[str] = [
+        "pick up", "picked up",
+        "put", "place", "move", "push", "pull", "slide", "drag",
+        "take", "took", "grab", "grabbed", "grasp", "grasped",
+        "lift", "lifted", "flip", "flipped", "turn", "turned",
+        "open", "opened", "close", "closed",
+        "stack", "stacked",
+        "pick", "picked",
+        "get",
+    ]
+
+    # Prepositions that signal the END of the target noun phrase (start of
+    # destination/location). Longest patterns must be checked first.
+    _DESTINATION_PREPS: List[str] = [
+        "on top of", "on the right side of", "on the left side of",
+        "on the right of", "on the left of",
+        "to the right of", "to the left of",
+        "out of", "off of", "away from",
+        "into", "onto", "in to",
+        "to the", "to a",
+        "on the", "on a",
+        "in the", "in a",
+        "from the", "from a",
+        "near the", "near a",
+        "next to", "beside",
+        "and put", "and place", "and move",
+        "then put", "then place",
+    ]
+
+    def _extract_manipulated_object(self, instruction: str) -> str:
+        """Extract the manipulated object noun phrase from a BridgeDataV2 instruction.
+
+        BridgeDataV2 instructions are highly templated: VERB [TARGET] PREP [DESTINATION].
+        We find the verb, take everything after it up to the first destination
+        preposition, and return that as the GroundingDINO query.
+
+        Falls back to the full instruction if no pattern matches.
+        """
+        text = instruction.lower().strip().rstrip(".")
+
+        verbs = sorted(self._MANIPULATE_VERBS, key=len, reverse=True)
+        preps = sorted(self._DESTINATION_PREPS, key=len, reverse=True)
+
+        for verb in verbs:
+            if verb not in text:
+                continue
+            after_verb = text.split(verb, 1)[1].strip()
+            if not after_verb:
+                continue
+
+            # Find earliest destination prep
+            target = after_verb
+            for prep in preps:
+                if prep in after_verb:
+                    candidate = after_verb.split(prep, 1)[0].strip()
+                    # Take the shortest match (earliest prep)
+                    if len(candidate) < len(target):
+                        target = candidate
+
+            # Remove trailing junk left by compound sentences
+            for suffix in (" and", " then", " it", ","):
+                if target.endswith(suffix):
+                    target = target[: -len(suffix)].strip()
+
+            if target and 1 <= len(target.split()) <= 6:
+                return target
+
+        # No verb pattern matched — return full instruction as fallback
+        return text
+
+    # ------------------------------------------------------------------
     # Target detection (called at trajectory start + gripper state changes)
     # ------------------------------------------------------------------
 
@@ -311,6 +392,15 @@ class GeometricExtractor:
         """Detect the target object referenced by the instruction.
 
         Updates self.target_box and self.target_depth as side effects.
+
+        Steps:
+          1. Parse the instruction to extract the manipulated object noun phrase.
+          2. Query GroundingDINO with that phrase only.
+          3. Filter detections by size (reject anything larger than
+             max_target_bbox_area — these are almost always the table or
+             destination, not the small manipulated object).
+          4. Select highest-confidence surviving detection; if all are too large,
+             fall back to the smallest above-threshold detection.
 
         Args:
             image: RGB uint8 image (H, W, 3).
@@ -324,67 +414,60 @@ class GeometricExtractor:
 
         self._target_detection_attempts += 1
 
-        all_boxes: List[np.ndarray] = []
-        all_confs: List[float] = []
-        all_phrases: List[str] = []
-        all_queries: List[str] = []
+        # Step 1: parse instruction → target noun phrase
+        target_phrase = self._extract_manipulated_object(instruction)
+        query = target_phrase if target_phrase.endswith(".") else target_phrase + "."
 
-        # Query 1: full instruction
+        print(f"  [DINO] instruction: \"{instruction}\"", flush=True)
+        print(f"  [DINO] extracted target: \"{target_phrase}\" | query: \"{query}\"", flush=True)
+
+        # Step 2: single GroundingDINO query with the extracted phrase
         try:
-            boxes, confs, phrases = self._detect_objects(image, instruction)
-            for i in range(len(boxes)):
-                all_boxes.append(boxes[i])
-                all_confs.append(float(confs[i]))
-                all_phrases.append(phrases[i] if i < len(phrases) else "?")
-                all_queries.append("full")
+            boxes, confs, phrases = self._detect_objects(image, query)
         except Exception as e:
-            print(f"detect_target: full-instruction query failed: {e}")
-
-        # Query 2: last 2-3 words fallback
-        words = instruction.lower().strip().split()
-        if len(words) >= 3:
-            fallback_prompt = " ".join(words[-3:]) + "."
-        elif len(words) >= 1:
-            fallback_prompt = " ".join(words) + "."
-        else:
-            fallback_prompt = None
-
-        if fallback_prompt:
-            try:
-                boxes2, confs2, phrases2 = self._detect_objects(image, fallback_prompt)
-                for i in range(len(boxes2)):
-                    all_boxes.append(boxes2[i])
-                    all_confs.append(float(confs2[i]))
-                    all_phrases.append(phrases2[i] if i < len(phrases2) else "?")
-                    all_queries.append("fallback")
-            except Exception as e:
-                print(f"detect_target: fallback query failed: {e}")
-
-        # Log all candidates so we can see what DINO is finding
-        q1_label = f'"{instruction}"'
-        q2_label = f'"{fallback_prompt}"' if fallback_prompt else "n/a"
-        if all_boxes:
-            cand_strs = [
-                f'{ph}({q}:{c:.2f})'
-                for ph, q, c in zip(all_phrases, all_queries, all_confs)
-            ]
-            print(f"  [DINO] q1={q1_label} q2={q2_label} | candidates: {', '.join(cand_strs)}", flush=True)
-        else:
-            print(f"  [DINO] q1={q1_label} q2={q2_label} | NO detections above threshold", flush=True)
-
-        if not all_boxes:
+            print(f"  [DINO] query failed: {e}", flush=True)
             self._target_detection_failures += 1
             self.target_box = None
             self.target_depth = None
             return None
 
-        best_idx = int(np.argmax(all_confs))
-        best_box = np.asarray(all_boxes[best_idx], dtype=np.float32)
-        best_conf = all_confs[best_idx]
-        best_phrase = all_phrases[best_idx]
-        best_query = all_queries[best_idx]
-        print(f"  [DINO] selected: '{best_phrase}' via {best_query} query (conf={best_conf:.3f}, "
-              f"cx={best_box[0]:.3f} cy={best_box[1]:.3f} w={best_box[2]:.3f} h={best_box[3]:.3f})", flush=True)
+        if len(boxes) == 0:
+            print(f"  [DINO] NO detections above threshold (conf>{self.confidence_threshold})", flush=True)
+            self._target_detection_failures += 1
+            self.target_box = None
+            self.target_depth = None
+            return None
+
+        # Log all raw candidates
+        cand_strs = [
+            f"{phrases[i] if i < len(phrases) else '?'}(conf={confs[i]:.2f}, area={boxes[i][2]*boxes[i][3]:.3f})"
+            for i in range(len(boxes))
+        ]
+        print(f"  [DINO] candidates: {', '.join(cand_strs)}", flush=True)
+
+        # Step 3: size filter — reject detections too large to be a manipulated object
+        areas = np.array([boxes[i][2] * boxes[i][3] for i in range(len(boxes))], dtype=np.float32)
+        valid = np.where(areas <= self.max_target_bbox_area)[0]
+
+        if len(valid) > 0:
+            best_idx = int(valid[np.argmax(confs[valid])])
+            size_note = "size OK"
+        else:
+            # All detections exceed the size filter — use smallest as last resort
+            best_idx = int(np.argmin(areas))
+            size_note = f"WARNING: all exceed size filter (max={self.max_target_bbox_area:.2f}), using smallest"
+
+        best_box = np.asarray(boxes[best_idx], dtype=np.float32)
+        best_conf = float(confs[best_idx])
+        best_phrase = phrases[best_idx] if best_idx < len(phrases) else "?"
+        best_area = float(areas[best_idx])
+
+        print(
+            f"  [DINO] selected: '{best_phrase}' "
+            f"(conf={best_conf:.3f}, cx={best_box[0]:.3f} cy={best_box[1]:.3f} "
+            f"area={best_area:.3f}) [{size_note}]",
+            flush=True,
+        )
 
         self._target_conf_sum += best_conf
         self._target_conf_count += 1
@@ -405,7 +488,7 @@ class GeometricExtractor:
                 d_max = float(depth_map.max())
                 self.target_depth = (d - d_min) / (d_max - d_min + 1e-8)
             except Exception as e:
-                print(f"detect_target: depth lookup failed: {e}")
+                print(f"  [DINO] depth lookup failed: {e}", flush=True)
                 self.target_depth = None
 
         return best_box
