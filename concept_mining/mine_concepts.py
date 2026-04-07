@@ -553,7 +553,7 @@ def mine_concepts_pass_b(
     pass_a_concepts_path: Optional[Path] = None,
     max_trajectories: Optional[int] = None,
     save_images: bool = False,
-    use_depth: bool = False,
+    use_depth: bool = True,
     depth_model: str = "LiheYoung/depth-anything-v2-small-hf",
     workspace_x_min: float = 0.1,
     workspace_x_max: float = 0.4,
