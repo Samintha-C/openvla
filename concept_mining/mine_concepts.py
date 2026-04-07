@@ -372,14 +372,16 @@ def extract_concepts_from_trajectory_pass_b(
     geometric_extractor: GeometricExtractor,
     verbose: bool = False,
     images_save_dir: Optional[Path] = None,
+    gripper_closed_threshold: float = 0.05,
 ) -> List[Dict[str, Any]]:
     """
     Extract Pass B (geometric) concepts from a trajectory.
 
-    Returns:
-        List of concept dictionaries, one per frame
+    Runs GroundingDINO once on the first frame to detect the target, then
+    re-runs it when the gripper state flips (a proxy for keyframes where the
+    target may have moved). EEF concepts come from per-frame proprio.
     """
-    concept_records = []
+    concept_records: List[Dict[str, Any]] = []
     geometric_extractor.reset()
 
     if "observation" not in traj:
@@ -404,16 +406,29 @@ def extract_concepts_from_trajectory_pass_b(
             print(f"  [traj {episode_idx}] SKIP: no images found. obs keys: {list(obs.keys())}")
         return concept_records
 
+    # Proprio may be absent for some datasets — degrade gracefully.
+    proprio_np: Optional[np.ndarray] = None
+    if "proprio" in obs:
+        proprio_raw = obs["proprio"]
+        if isinstance(proprio_raw, tf.Tensor):
+            proprio_np = proprio_raw.numpy()
+        else:
+            proprio_np = np.asarray(proprio_raw)
+    else:
+        if verbose:
+            print(f"  [traj {episode_idx}] WARNING: no proprio in obs; EEF concepts will be zero.")
+
     instruction = None
     if "task" in traj and "language_instruction" in traj["task"]:
         instruction = traj["task"]["language_instruction"]
-        if isinstance(instruction, (bytes, tf.Tensor)):
-            if isinstance(instruction, tf.Tensor):
-                instruction = instruction.numpy()
-            if isinstance(instruction, bytes):
-                instruction = instruction.decode("utf-8")
-            else:
-                instruction = str(instruction)
+        if isinstance(instruction, tf.Tensor):
+            instruction = instruction.numpy()
+        if isinstance(instruction, np.ndarray):
+            instruction = instruction.flat[0] if instruction.size > 0 else b""
+        if isinstance(instruction, (list, tuple)):
+            instruction = instruction[0] if len(instruction) > 0 else b""
+        if isinstance(instruction, (bytes, np.bytes_)):
+            instruction = instruction.decode("utf-8", errors="replace")
         instruction = str(instruction).strip()
 
     if not instruction:
@@ -460,17 +475,48 @@ def extract_concepts_from_trajectory_pass_b(
             print(f"  [traj {episode_idx}] SKIP: unexpected image shape {images_np.shape}")
         return concept_records
 
+    # Align proprio length to image length (some datasets may be off by one)
+    if proprio_np is not None and len(proprio_np) < traj_len:
+        if verbose:
+            print(f"  [traj {episode_idx}] WARNING: proprio len {len(proprio_np)} < traj len {traj_len}, padding with last value")
+        pad = np.repeat(proprio_np[-1:], traj_len - len(proprio_np), axis=0)
+        proprio_np = np.concatenate([proprio_np, pad], axis=0)
+
     episode_id = f"{dataset_name}_episode_{episode_idx:06d}"
 
-    for frame_idx in range(traj_len):
-        img = images_np[frame_idx]
+    def _prepare(img):
         if img.dtype != np.uint8:
             if img.max() <= 1.0:
-                img = (img * 255).astype(np.uint8)
-            else:
-                img = img.astype(np.uint8)
+                return (img * 255).astype(np.uint8)
+            return img.astype(np.uint8)
+        return img
 
-        geometric_concepts = geometric_extractor.extract(img, instruction)
+    # --- Run initial target detection on the first frame ---
+    first_img = _prepare(images_np[0])
+    geometric_extractor.detect_target(first_img, instruction)
+
+    # If no proprio is available, re-detect every frame as a fallback
+    # (otherwise target concepts would be stale and EEF concepts are zero,
+    # leaving nothing time-varying).
+    redetect_every_frame = proprio_np is None
+
+    prev_gripper_closed: Optional[bool] = None
+
+    for frame_idx in range(traj_len):
+        img = _prepare(images_np[frame_idx])
+        proprio_frame = proprio_np[frame_idx] if proprio_np is not None else None
+
+        # Re-run target detection on gripper-state changes (keyframe proxy)
+        if proprio_frame is not None:
+            gripper_val = float(proprio_frame[-1])
+            gripper_closed = gripper_val < gripper_closed_threshold
+            if prev_gripper_closed is not None and gripper_closed != prev_gripper_closed:
+                geometric_extractor.detect_target(img, instruction)
+            prev_gripper_closed = gripper_closed
+        elif redetect_every_frame and frame_idx > 0:
+            geometric_extractor.detect_target(img, instruction)
+
+        geometric_concepts = geometric_extractor.extract(img, instruction, proprio_frame)
 
         concept_record = {
             "dataset_name": dataset_name,
@@ -494,11 +540,18 @@ def mine_concepts_pass_b(
     output_path: Path,
     train: bool = True,
     confidence_threshold: float = 0.3,
-    alignment_pixel_threshold: int = 50,
     pass_a_concepts_path: Optional[Path] = None,
-    detection_stride: int = 1,
     max_trajectories: Optional[int] = None,
     save_images: bool = False,
+    use_depth: bool = False,
+    depth_model: str = "LiheYoung/depth-anything-v2-small-hf",
+    workspace_x_min: float = 0.1,
+    workspace_x_max: float = 0.4,
+    workspace_y_min: float = -0.15,
+    workspace_y_max: float = 0.25,
+    workspace_z_min: float = 0.0,
+    workspace_z_max: float = 0.3,
+    gripper_closed_threshold: float = 0.05,
 ):
     """
     Mine Pass B (geometric) concepts from RLDS dataset using GroundingDINO.
@@ -529,10 +582,17 @@ def mine_concepts_pass_b(
     
     geometric_extractor = GeometricExtractor(
         confidence_threshold=confidence_threshold,
-        alignment_pixel_threshold=alignment_pixel_threshold,
-        detection_stride=detection_stride,
+        use_depth=use_depth,
+        depth_model_name=depth_model,
+        workspace_x_min=workspace_x_min,
+        workspace_x_max=workspace_x_max,
+        workspace_y_min=workspace_y_min,
+        workspace_y_max=workspace_y_max,
+        workspace_z_min=workspace_z_min,
+        workspace_z_max=workspace_z_max,
     )
-    print(f"Detection stride: {detection_stride} (inference every {detection_stride} frames)")
+    print(f"Target detection: once per trajectory + on gripper-state changes")
+    print(f"Depth estimation: {'enabled' if use_depth else 'disabled'}")
     if max_trajectories is not None:
         print(f"Max trajectories: {max_trajectories}")
 
@@ -551,7 +611,7 @@ def mine_concepts_pass_b(
         data_root_dir=data_dir,
         load_camera_views=("primary",),
         load_depth=False,
-        load_proprio=False,
+        load_proprio=True,
         load_language=True,
     )
     dataset_kwargs["name"] = dataset_name
@@ -604,6 +664,7 @@ def mine_concepts_pass_b(
             concept_records = extract_concepts_from_trajectory_pass_b(
                 traj, dataset_name, traj_idx, geometric_extractor,
                 verbose=verbose, images_save_dir=images_save_dir,
+                gripper_closed_threshold=gripper_closed_threshold,
             )
         except Exception as e:
             print(f"Error extracting concepts from trajectory {traj_idx}, skipping: {e}")
@@ -653,8 +714,8 @@ def mine_concepts_pass_b(
             frames = len(all_concept_records)
             gstats = geometric_extractor.get_stats()
             print(f"\n[{traj_idx+1} trajs | {elapsed:.0f}s | {rate:.1f} traj/s | frames={frames} | skipped={skip_count}]", flush=True)
-            print(f"  Gripper: detected={gstats['gripper_detected']}  fallback_to_prior={gstats['gripper_fallback']} ({gstats['gripper_fallback_pct']:.1f}%)", flush=True)
-            print(f"  Target:  detections={gstats['target_detections']}  mean_conf={gstats['target_mean_conf']:.3f}", flush=True)
+            print(f"  Target:  attempts={gstats['target_detection_attempts']}  failures={gstats['target_detection_failures']} ({gstats['target_detection_fail_pct']:.1f}%)  mean_conf={gstats['target_mean_conf']:.3f}", flush=True)
+            print(f"  Proprio: with={gstats['frames_with_proprio']}  without={gstats['frames_without_proprio']}", flush=True)
             concept_nonzero = concept_sums.get("__nonzero__", {})
             print(f"  Concept rates (positive or nonzero):", flush=True)
             for k in concept_counts:
@@ -718,11 +779,17 @@ def main():
     parser.add_argument("--table_height", type=float, default=0.0, help="Table height threshold (Pass A)")
     
     parser.add_argument("--confidence_threshold", type=float, default=0.3, help="GroundingDINO confidence threshold (Pass B)")
-    parser.add_argument("--alignment_pixel_threshold", type=int, default=50, help="Alignment pixel threshold (Pass B)")
     parser.add_argument("--pass_a_concepts_path", type=str, default=None, help="Path to Pass A concepts to merge (Pass B)")
-    parser.add_argument("--detection_stride", type=int, default=1, help="Run GroundingDINO every N frames (Pass B, default: 1)")
     parser.add_argument("--max_trajectories", type=int, default=None, help="Stop after N trajectories (Pass B, default: None = all)")
     parser.add_argument("--save_images", action="store_true", help="Save each frame as JPEG alongside the concept dataset (Pass B)")
+    parser.add_argument("--use_depth", action="store_true", help="Enable monocular depth estimation (Pass B)")
+    parser.add_argument("--depth_model", type=str, default="LiheYoung/depth-anything-v2-small-hf", help="HF model name for depth (Pass B)")
+    parser.add_argument("--workspace_x_min", type=float, default=0.1, help="Workspace X lower bound (Pass B)")
+    parser.add_argument("--workspace_x_max", type=float, default=0.4, help="Workspace X upper bound (Pass B)")
+    parser.add_argument("--workspace_y_min", type=float, default=-0.15, help="Workspace Y lower bound (Pass B)")
+    parser.add_argument("--workspace_y_max", type=float, default=0.25, help="Workspace Y upper bound (Pass B)")
+    parser.add_argument("--workspace_z_min", type=float, default=0.0, help="Workspace Z lower bound (Pass B)")
+    parser.add_argument("--workspace_z_max", type=float, default=0.3, help="Workspace Z upper bound (Pass B)")
     
     args = parser.parse_args()
     
@@ -749,11 +816,18 @@ def main():
             output_path=Path(args.output_path) if args.pass_type == "b" else Path(args.output_path) / "pass_b",
             train=train,
             confidence_threshold=args.confidence_threshold,
-            alignment_pixel_threshold=args.alignment_pixel_threshold,
             pass_a_concepts_path=pass_a_path,
-            detection_stride=args.detection_stride,
             max_trajectories=args.max_trajectories,
             save_images=args.save_images,
+            use_depth=args.use_depth,
+            depth_model=args.depth_model,
+            workspace_x_min=args.workspace_x_min,
+            workspace_x_max=args.workspace_x_max,
+            workspace_y_min=args.workspace_y_min,
+            workspace_y_max=args.workspace_y_max,
+            workspace_z_min=args.workspace_z_min,
+            workspace_z_max=args.workspace_z_max,
+            gripper_closed_threshold=args.gripper_closed_threshold,
         )
 
 

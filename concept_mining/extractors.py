@@ -96,87 +96,112 @@ class ProprioceptiveExtractor:
 
 
 class GeometricExtractor:
-    """Extract geometric concepts using GroundingDINO.
+    """Extract geometric concepts using GroundingDINO + proprioception.
 
-    Produces a fixed-dimension vector of hybrid continuous + categorical
-    spatial concepts per frame, designed for downstream consumption by a
-    linear concept-bottleneck layer.  Concepts follow the SCoBots design:
-    signed per-axis directed distances (never Euclidean), temporal deltas,
-    and overlap/size proxies.
+    Produces per-frame spatial concepts designed to feed a linear concept
+    bottleneck layer. Target position comes from GroundingDINO (run at
+    trajectory start and on gripper-state changes); EEF position comes from
+    per-frame proprioception, so spatial concepts vary every frame. An
+    optional monocular depth estimate augments the target with a z-proxy.
+
+    The extractor does NOT compute precomputed differences (e.g. dx_eef_target)
+    because the camera-to-robot axis mapping is unknown. Instead it emits raw
+    normalized EEF and target positions; a downstream linear layer can learn
+    the mapping.
     """
 
-    # Keys returned by extract(), in deterministic order.
     CONCEPT_KEYS: List[str] = [
         "target_visible",
-        "obstacle_present",
-        "dx_gripper_target",
-        "dy_gripper_target",
-        "target_relative_size",
-        "gripper_target_iou",
-        "target_dx_delta",
-        "target_dy_delta",
+        "target_cx",
+        "target_cy",
+        "target_bbox_size",
+        "target_depth",
+        "eef_x",
+        "eef_y",
+        "eef_z",
+        "eef_delta_x",
+        "eef_delta_y",
+        "eef_delta_z",
     ]
 
     def __init__(
         self,
         confidence_threshold: float = 0.3,
-        alignment_pixel_threshold: int = 50,
         device: Optional[str] = None,
-        detection_stride: int = 1,
-        gripper_query: str = "robot gripper . robot arm . end effector .",
-        obstacle_query: str = "object . item . container . tool .",
+        use_depth: bool = False,
+        depth_model_name: str = "LiheYoung/depth-anything-v2-small-hf",
+        workspace_x_min: float = 0.1,
+        workspace_x_max: float = 0.4,
+        workspace_y_min: float = -0.15,
+        workspace_y_max: float = 0.25,
+        workspace_z_min: float = 0.0,
+        workspace_z_max: float = 0.3,
     ):
         """
         Args:
-            confidence_threshold: Minimum confidence for object detection.
-            alignment_pixel_threshold: Kept for backward compat (unused).
-            device: Device to run GroundingDINO on.
-            detection_stride: Run detection every N frames; carry forward
-                for skipped frames.
-            gripper_query: GroundingDINO text prompt for gripper detection.
-            obstacle_query: GroundingDINO text prompt for obstacle detection.
+            confidence_threshold: Minimum confidence for GroundingDINO detections.
+            device: Device to run GroundingDINO / depth on.
+            use_depth: If True, load DepthAnythingV2 for target z-proxy.
+            depth_model_name: HF model name for monocular depth estimator.
+            workspace_{x,y,z}_{min,max}: Empirical EEF workspace bounds used to
+                normalize proprio XYZ into [0, 1]. Defaults tuned for
+                BridgeDataV2 WidowX.
         """
         self.confidence_threshold = confidence_threshold
-        self.alignment_pixel_threshold = alignment_pixel_threshold
         if device is None:
             self.device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
         else:
             self.device = device
-        self.detection_stride = max(1, detection_stride)
-        self.gripper_query = gripper_query
-        self.obstacle_query = obstacle_query
+
+        self.use_depth = use_depth
+        self.depth_model_name = depth_model_name
+
+        self.workspace_x_min = workspace_x_min
+        self.workspace_x_max = workspace_x_max
+        self.workspace_y_min = workspace_y_min
+        self.workspace_y_max = workspace_y_max
+        self.workspace_z_min = workspace_z_min
+        self.workspace_z_max = workspace_z_max
 
         self.model = None
+        self.depth_estimator = None
         self._load_model()
+        if self.use_depth:
+            self._load_depth_model()
         self.reset()
         self.reset_stats()
 
     def reset(self) -> None:
-        """Clear all per-trajectory temporal state. Call between trajectories."""
-        self.prev_target_cx: Optional[float] = None
-        self.prev_target_cy: Optional[float] = None
-        self._cached_gripper_box: Optional[np.ndarray] = None
-        self._frame_counter: int = 0
-        self._last_detection_result: Optional[Dict[str, float]] = None
+        """Clear all per-trajectory state. Call between trajectories."""
+        self.target_box: Optional[np.ndarray] = None       # [cx, cy, w, h] normalized
+        self.target_depth: Optional[float] = None          # normalized [0, 1]
+        self.prev_proprio: Optional[np.ndarray] = None     # for delta concepts
 
     def reset_stats(self) -> None:
         """Reset cumulative diagnostic counters. Call once before a mining run."""
-        self._gripper_detected: int = 0   # GroundingDINO found the gripper
-        self._gripper_fallback: int = 0   # fell back to fixed prior
         self._target_conf_sum: float = 0.0
         self._target_conf_count: int = 0
+        self._target_detection_attempts: int = 0
+        self._target_detection_failures: int = 0
+        self._frames_with_proprio: int = 0
+        self._frames_without_proprio: int = 0
 
     def get_stats(self) -> dict:
         """Return cumulative diagnostic stats across all processed frames."""
-        total_gripper = self._gripper_detected + self._gripper_fallback
-        fallback_pct = 100.0 * self._gripper_fallback / total_gripper if total_gripper > 0 else 0.0
         mean_conf = self._target_conf_sum / self._target_conf_count if self._target_conf_count > 0 else 0.0
+        fail_pct = 100.0 * self._target_detection_failures / self._target_detection_attempts if self._target_detection_attempts > 0 else 0.0
         return {
-            "gripper_detected": self._gripper_detected,
-            "gripper_fallback": self._gripper_fallback,
-            "gripper_fallback_pct": fallback_pct,
+            "target_detection_attempts": self._target_detection_attempts,
+            "target_detection_failures": self._target_detection_failures,
+            "target_detection_fail_pct": fail_pct,
             "target_detections": self._target_conf_count,
             "target_mean_conf": mean_conf,
+            "frames_with_proprio": self._frames_with_proprio,
+            "frames_without_proprio": self._frames_without_proprio,
+            # Back-compat keys for existing logging
+            "gripper_detected": 0,
+            "gripper_fallback": 0,
+            "gripper_fallback_pct": 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -229,30 +254,24 @@ class GeometricExtractor:
             self.model = None
 
     # ------------------------------------------------------------------
-    # Helper: IoU in normalised cxcywh
+    # Depth model loading
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _compute_iou(box1: np.ndarray, box2: np.ndarray) -> float:
-        """Compute IoU between two boxes in [cx, cy, w, h] normalised format."""
-        # Convert to x1y1x2y2
-        x1_a, y1_a = box1[0] - box1[2] / 2, box1[1] - box1[3] / 2
-        x2_a, y2_a = box1[0] + box1[2] / 2, box1[1] + box1[3] / 2
-        x1_b, y1_b = box2[0] - box2[2] / 2, box2[1] - box2[3] / 2
-        x2_b, y2_b = box2[0] + box2[2] / 2, box2[1] + box2[3] / 2
-
-        inter_x1 = max(x1_a, x1_b)
-        inter_y1 = max(y1_a, y1_b)
-        inter_x2 = min(x2_a, x2_b)
-        inter_y2 = min(y2_a, y2_b)
-
-        inter_area = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
-        area_a = box1[2] * box1[3]
-        area_b = box2[2] * box2[3]
-        union = area_a + area_b - inter_area
-        if union <= 0:
-            return 0.0
-        return float(inter_area / union)
+    def _load_depth_model(self) -> None:
+        """Load DepthAnythingV2 via HF pipeline. Sets self.depth_estimator or leaves None."""
+        if not TORCH_AVAILABLE:
+            return
+        try:
+            from transformers import pipeline
+            self.depth_estimator = pipeline(
+                "depth-estimation",
+                model=self.depth_model_name,
+                device=0 if self.device == "cuda" else -1,
+            )
+            print(f"Depth estimator loaded: {self.depth_model_name} on {self.device}")
+        except Exception as e:
+            print(f"Warning: Failed to load depth model ({self.depth_model_name}): {e}")
+            self.depth_estimator = None
 
     # ------------------------------------------------------------------
     # Helper: raw GroundingDINO detection
@@ -263,14 +282,9 @@ class GeometricExtractor:
     ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """Run GroundingDINO detection.
 
-        Args:
-            image: RGB uint8 (H, W, 3).
-            text_prompt: Caption/query for GroundingDINO.
-
         Returns:
             (boxes, confidences, phrases) where boxes is (N, 4) normalised
-            cxcywh, confidences is (N,), phrases is length-N list of strings.
-            Returns empty arrays when nothing is detected.
+            cxcywh. Empty arrays if nothing detected.
         """
         img_pil = Image.fromarray(image)
         img_transformed, _ = self.transform(img_pil, None)
@@ -290,49 +304,39 @@ class GeometricExtractor:
         return boxes.cpu().numpy(), logits.cpu().numpy(), phrases
 
     # ------------------------------------------------------------------
-    # Helper: gripper detection (cached per trajectory)
+    # Target detection (called at trajectory start + gripper state changes)
     # ------------------------------------------------------------------
 
-    def _detect_gripper(self, image: np.ndarray) -> Optional[np.ndarray]:
-        """Detect gripper. Returns [cx, cy, w, h] normalised or None."""
-        if self._cached_gripper_box is not None:
-            return self._cached_gripper_box
+    def detect_target(self, image: np.ndarray, instruction: str) -> Optional[np.ndarray]:
+        """Detect the target object referenced by the instruction.
 
-        boxes, confs, _ = self._detect_objects(image, self.gripper_query)
-        if len(boxes) > 0:
-            best = boxes[confs.argmax()]
-            self._cached_gripper_box = best
-            self._gripper_detected += 1
-            return best
-        self._gripper_fallback += 1
-        return None
+        Updates self.target_box and self.target_depth as side effects.
 
-    # ------------------------------------------------------------------
-    # Helper: target detection (highest-conf non-gripper detection)
-    # ------------------------------------------------------------------
+        Args:
+            image: RGB uint8 image (H, W, 3).
+            instruction: Language instruction string.
 
-    def _detect_target(
-        self,
-        image: np.ndarray,
-        instruction: str,
-        gripper_box: Optional[np.ndarray],
-    ) -> Optional[np.ndarray]:
-        """Detect target object. Returns [cx, cy, w, h] normalised or None.
-
-        Uses two GroundingDINO queries — the full instruction and a
-        fallback noun-phrase extraction — then picks the highest-confidence
-        detection that does not overlap significantly with the gripper.
+        Returns:
+            Target bbox [cx, cy, w, h] normalized, or None if nothing found.
         """
+        if self.model is None:
+            return None
+
+        self._target_detection_attempts += 1
+
         all_boxes: List[np.ndarray] = []
         all_confs: List[float] = []
 
         # Query 1: full instruction
-        boxes, confs, _ = self._detect_objects(image, instruction)
-        for i in range(len(boxes)):
-            all_boxes.append(boxes[i])
-            all_confs.append(float(confs[i]))
+        try:
+            boxes, confs, _ = self._detect_objects(image, instruction)
+            for i in range(len(boxes)):
+                all_boxes.append(boxes[i])
+                all_confs.append(float(confs[i]))
+        except Exception as e:
+            print(f"detect_target: full-instruction query failed: {e}")
 
-        # Query 2: fallback last noun phrase (last 2-3 words)
+        # Query 2: last 2-3 words fallback
         words = instruction.lower().strip().split()
         if len(words) >= 3:
             fallback_prompt = " ".join(words[-3:]) + "."
@@ -342,24 +346,62 @@ class GeometricExtractor:
             fallback_prompt = None
 
         if fallback_prompt:
-            boxes2, confs2, _ = self._detect_objects(image, fallback_prompt)
-            for i in range(len(boxes2)):
-                all_boxes.append(boxes2[i])
-                all_confs.append(float(confs2[i]))
+            try:
+                boxes2, confs2, _ = self._detect_objects(image, fallback_prompt)
+                for i in range(len(boxes2)):
+                    all_boxes.append(boxes2[i])
+                    all_confs.append(float(confs2[i]))
+            except Exception as e:
+                print(f"detect_target: fallback query failed: {e}")
 
         if not all_boxes:
+            self._target_detection_failures += 1
+            self.target_box = None
+            self.target_depth = None
             return None
 
-        # Sort by confidence descending, pick best non-gripper box
-        indices = sorted(range(len(all_confs)), key=lambda i: all_confs[i], reverse=True)
-        for idx in indices:
-            box = all_boxes[idx]
-            if gripper_box is not None and self._compute_iou(box, gripper_box) > 0.3:
-                continue
-            self._target_conf_sum += all_confs[idx]
-            self._target_conf_count += 1
-            return box
-        return None
+        best_idx = int(np.argmax(all_confs))
+        best_box = np.asarray(all_boxes[best_idx], dtype=np.float32)
+        best_conf = all_confs[best_idx]
+
+        self._target_conf_sum += best_conf
+        self._target_conf_count += 1
+        self.target_box = best_box
+
+        # Optional depth lookup at target center
+        self.target_depth = None
+        if self.depth_estimator is not None:
+            try:
+                pil_img = Image.fromarray(image)
+                depth_output = self.depth_estimator(pil_img)
+                depth_map = np.array(depth_output["depth"], dtype=np.float32)
+                img_h, img_w = depth_map.shape[:2]
+                px = int(np.clip(best_box[0] * img_w, 0, img_w - 1))
+                py = int(np.clip(best_box[1] * img_h, 0, img_h - 1))
+                d = float(depth_map[py, px])
+                d_min = float(depth_map.min())
+                d_max = float(depth_map.max())
+                self.target_depth = (d - d_min) / (d_max - d_min + 1e-8)
+            except Exception as e:
+                print(f"detect_target: depth lookup failed: {e}")
+                self.target_depth = None
+
+        return best_box
+
+    # ------------------------------------------------------------------
+    # Proprio normalization
+    # ------------------------------------------------------------------
+
+    def _normalize_proprio_xyz(self, proprio: np.ndarray) -> Tuple[float, float, float]:
+        """Normalize proprio XYZ to [0, 1] using workspace bounds."""
+        x = (float(proprio[0]) - self.workspace_x_min) / (self.workspace_x_max - self.workspace_x_min)
+        y = (float(proprio[1]) - self.workspace_y_min) / (self.workspace_y_max - self.workspace_y_min)
+        z = (float(proprio[2]) - self.workspace_z_min) / (self.workspace_z_max - self.workspace_z_min)
+        return (
+            float(np.clip(x, 0.0, 1.0)),
+            float(np.clip(y, 0.0, 1.0)),
+            float(np.clip(z, 0.0, 1.0)),
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -369,98 +411,51 @@ class GeometricExtractor:
         self,
         image: np.ndarray,
         instruction: str,
-        gripper_bbox: Optional[Tuple[int, int, int, int]] = None,
+        proprio: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
-        """Extract geometric concepts from a single frame.
+        """Extract per-frame geometric concepts.
+
+        Reads target state from self.target_box / self.target_depth (set by
+        detect_target()) and EEF state from the supplied proprio vector.
 
         Args:
-            image: RGB image as numpy array (H, W, 3) uint8.
-            instruction: Language instruction for the current trajectory.
-            gripper_bbox: Optional gripper bounding box (x1, y1, x2, y2) in
-                pixels. If None, the gripper is auto-detected or a fixed
-                prior is used.
+            image: RGB uint8 image (H, W, 3). Currently only used for shape.
+            instruction: Language instruction (unused here; kept for signature
+                stability and potential future use).
+            proprio: Optional per-frame proprio vector. If None, EEF concepts
+                are set to 0.0.
 
         Returns:
             Dictionary of concept values (see CONCEPT_KEYS).
         """
         concepts = {k: 0.0 for k in self.CONCEPT_KEYS}
 
-        if self.model is None:
-            return concepts
+        # --- Target concepts (from stored detection) ---
+        if self.target_box is not None:
+            concepts["target_visible"] = 1.0
+            concepts["target_cx"] = float(self.target_box[0])
+            concepts["target_cy"] = float(self.target_box[1])
+            concepts["target_bbox_size"] = float(self.target_box[2] * self.target_box[3])
+            if self.target_depth is not None:
+                concepts["target_depth"] = float(self.target_depth)
 
-        # --- stride: carry forward previous detection on skipped frames ---
-        self._frame_counter += 1
-        if (self._frame_counter - 1) % self.detection_stride != 0:
-            if self._last_detection_result is not None:
-                return dict(self._last_detection_result)
-            return concepts
+        # --- EEF concepts (from proprio) ---
+        if proprio is not None and len(proprio) >= 3:
+            self._frames_with_proprio += 1
+            eef_x, eef_y, eef_z = self._normalize_proprio_xyz(proprio)
+            concepts["eef_x"] = eef_x
+            concepts["eef_y"] = eef_y
+            concepts["eef_z"] = eef_z
 
-        img_h, img_w = image.shape[:2]
+            if self.prev_proprio is not None:
+                prev_x, prev_y, prev_z = self._normalize_proprio_xyz(self.prev_proprio)
+                concepts["eef_delta_x"] = eef_x - prev_x
+                concepts["eef_delta_y"] = eef_y - prev_y
+                concepts["eef_delta_z"] = eef_z - prev_z
 
-        try:
-            # --- Gripper box (normalised cxcywh) ---
-            if gripper_bbox is not None:
-                # Convert pixel xyxy to normalised cxcywh
-                x1, y1, x2, y2 = gripper_bbox
-                gripper_box = np.array([
-                    (x1 + x2) / 2.0 / img_w,
-                    (y1 + y2) / 2.0 / img_h,
-                    (x2 - x1) / img_w,
-                    (y2 - y1) / img_h,
-                ])
-            else:
-                gripper_box = self._detect_gripper(image)
-                if gripper_box is None:
-                    # Fixed prior: center-bottom of BridgeDataV2 frame
-                    gripper_box = np.array([0.5, 0.75, 0.15, 0.15])
+            self.prev_proprio = np.asarray(proprio, dtype=np.float32).copy()
+        else:
+            self._frames_without_proprio += 1
 
-            # --- Target detection ---
-            target_box = self._detect_target(image, instruction, gripper_box)
-
-            if target_box is not None:
-                concepts["target_visible"] = 1.0
-                target_cx, target_cy = float(target_box[0]), float(target_box[1])
-                target_w, target_h = float(target_box[2]), float(target_box[3])
-                gripper_cx, gripper_cy = float(gripper_box[0]), float(gripper_box[1])
-
-                # Signed per-axis directed distance (normalised by image dims,
-                # already in [0,1] space so range is ~ [-1, 1])
-                concepts["dx_gripper_target"] = target_cx - gripper_cx
-                concepts["dy_gripper_target"] = target_cy - gripper_cy
-
-                # Size / depth proxy
-                concepts["target_relative_size"] = target_w * target_h
-
-                # Overlap / grasp proxy
-                concepts["gripper_target_iou"] = self._compute_iou(target_box, gripper_box)
-
-                # Temporal deltas
-                if self.prev_target_cx is not None:
-                    concepts["target_dx_delta"] = target_cx - self.prev_target_cx
-                    concepts["target_dy_delta"] = target_cy - self.prev_target_cy
-
-                self.prev_target_cx = target_cx
-                self.prev_target_cy = target_cy
-            else:
-                # Target not visible — don't update temporal state so that
-                # the next visible frame computes delta from the last
-                # known position.
-                pass
-
-            # --- Obstacle detection ---
-            obs_boxes, obs_confs, _ = self._detect_objects(image, self.obstacle_query)
-            for i in range(len(obs_boxes)):
-                box = obs_boxes[i]
-                if target_box is not None and self._compute_iou(box, target_box) > 0.3:
-                    continue
-                if self._compute_iou(box, gripper_box) > 0.3:
-                    continue
-                concepts["obstacle_present"] = 1.0
-                break
-
-        except Exception as e:
-            print(f"Error in geometric extraction: {e}")
-
-        self._last_detection_result = dict(concepts)
         return concepts
 
