@@ -482,6 +482,16 @@ def extract_concepts_from_trajectory_pass_b(
         pad = np.repeat(proprio_np[-1:], traj_len - len(proprio_np), axis=0)
         proprio_np = np.concatenate([proprio_np, pad], axis=0)
 
+    # Diagnostic: print raw XYZ range so workspace bounds can be calibrated.
+    # eef_x/z saturating at 1.0 means actual values exceed the hardcoded bounds.
+    if proprio_np is not None and proprio_np.shape[1] >= 3:
+        xyz_min = proprio_np[:, :3].min(axis=0)
+        xyz_max = proprio_np[:, :3].max(axis=0)
+        print(f"  [PROPRIO-BOUNDS traj {episode_idx}] "
+              f"x=[{xyz_min[0]:.4f}, {xyz_max[0]:.4f}] "
+              f"y=[{xyz_min[1]:.4f}, {xyz_max[1]:.4f}] "
+              f"z=[{xyz_min[2]:.4f}, {xyz_max[2]:.4f}]", flush=True)
+
     episode_id = f"{dataset_name}_episode_{episode_idx:06d}"
 
     def _prepare(img):

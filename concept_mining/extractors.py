@@ -326,13 +326,17 @@ class GeometricExtractor:
 
         all_boxes: List[np.ndarray] = []
         all_confs: List[float] = []
+        all_phrases: List[str] = []
+        all_queries: List[str] = []
 
         # Query 1: full instruction
         try:
-            boxes, confs, _ = self._detect_objects(image, instruction)
+            boxes, confs, phrases = self._detect_objects(image, instruction)
             for i in range(len(boxes)):
                 all_boxes.append(boxes[i])
                 all_confs.append(float(confs[i]))
+                all_phrases.append(phrases[i] if i < len(phrases) else "?")
+                all_queries.append("full")
         except Exception as e:
             print(f"detect_target: full-instruction query failed: {e}")
 
@@ -347,12 +351,26 @@ class GeometricExtractor:
 
         if fallback_prompt:
             try:
-                boxes2, confs2, _ = self._detect_objects(image, fallback_prompt)
+                boxes2, confs2, phrases2 = self._detect_objects(image, fallback_prompt)
                 for i in range(len(boxes2)):
                     all_boxes.append(boxes2[i])
                     all_confs.append(float(confs2[i]))
+                    all_phrases.append(phrases2[i] if i < len(phrases2) else "?")
+                    all_queries.append("fallback")
             except Exception as e:
                 print(f"detect_target: fallback query failed: {e}")
+
+        # Log all candidates so we can see what DINO is finding
+        q1_label = f'"{instruction}"'
+        q2_label = f'"{fallback_prompt}"' if fallback_prompt else "n/a"
+        if all_boxes:
+            cand_strs = [
+                f'{ph}({q}:{c:.2f})'
+                for ph, q, c in zip(all_phrases, all_queries, all_confs)
+            ]
+            print(f"  [DINO] q1={q1_label} q2={q2_label} | candidates: {', '.join(cand_strs)}", flush=True)
+        else:
+            print(f"  [DINO] q1={q1_label} q2={q2_label} | NO detections above threshold", flush=True)
 
         if not all_boxes:
             self._target_detection_failures += 1
@@ -363,6 +381,10 @@ class GeometricExtractor:
         best_idx = int(np.argmax(all_confs))
         best_box = np.asarray(all_boxes[best_idx], dtype=np.float32)
         best_conf = all_confs[best_idx]
+        best_phrase = all_phrases[best_idx]
+        best_query = all_queries[best_idx]
+        print(f"  [DINO] selected: '{best_phrase}' via {best_query} query (conf={best_conf:.3f}, "
+              f"cx={best_box[0]:.3f} cy={best_box[1]:.3f} w={best_box[2]:.3f} h={best_box[3]:.3f})", flush=True)
 
         self._target_conf_sum += best_conf
         self._target_conf_count += 1
